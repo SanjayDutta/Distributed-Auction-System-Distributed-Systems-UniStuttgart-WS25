@@ -189,6 +189,23 @@ class Node:
                         if leader_uuid != self.node_id:
                              # self.start_client() # Could trigger here, but risky in thread
                              pass
+                        
+                elif msg_type == config.GET_AUCTIONS_MESSAGE:
+                    print("Replying with auctions")
+                    response = '"auction1": car'
+                    self.sock.sendto(response.encode(), addr)
+
+                elif msg_type == config.CREATE_AUCTION_MESSAGE:
+                    print("Create new auction")
+                    if len(parts) >= 3:
+                        item = parts[1]
+                        price = parts[2]
+
+                        print("Item, Price:", item, price)
+                        # TODO: Assign this auction to one of my servers
+
+                    response = "SUCCESS"
+                    self.sock.sendto(response.encode(), addr)
 
             except Exception as e:
                 print(f"[Listener Error] {e}")
