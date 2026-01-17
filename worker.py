@@ -1,17 +1,24 @@
 import socket
 import threading
 import time
+import uuid
 
 import config
 from auction import Auction
 
 
-class AuctionWorkerServer:
-    def __init__(self, host="0.0.0.0", port=None):
-        """Initialize the TCP worker server and in-memory state."""
+class WorkerService:
+    def __init__(self, worker_id, worker_ip, host="0.0.0.0", port=None, leader_port=None):
+        """Worker role: auction TCP server + leader control client."""
+        self.worker_id = worker_id
+        self.worker_ip = worker_ip
+        self.leader_ip = None
+        self.leader_port = config.LEADER_TCP_PORT if leader_port is None else leader_port
+
         self.host = host
         self.port = config.WORKER_TCP_PORT if port is None else port
         self.running = True
+        self.started = False
         # auction_id -> Auction
         self.auctions = {}
         # auction_id -> {client_id: socket}
@@ -25,11 +32,18 @@ class AuctionWorkerServer:
         self.sock.listen()
         self.port = self.sock.getsockname()[1]
 
-    def start(self):
-        """Start accepting TCP connections in a background thread."""
+    def start(self, leader_ip=None):
+        """Start accepting TCP connections and optionally register with leader."""
+        if self.started:
+            return None
+        print(f"[Worker] WorkerService starting on {self.host}:{self.port}")
+        self.started = True
         # Accept connections in the background so the main thread can do other work.
         accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         accept_thread.start()
+        if leader_ip:
+            self.leader_ip = leader_ip
+            self._register_with_leader()
         return accept_thread
 
     def stop(self):
@@ -76,13 +90,13 @@ class AuctionWorkerServer:
         parts = line.split(":")
         msg_type = parts[0]
 
-        if msg_type == config.WORKER_CREATE_MESSAGE:
+        if msg_type == config.AUCTION_CREATE_MESSAGE:
             return self._handle_create(parts, conn, joined_auctions)
-        if msg_type == config.WORKER_JOIN_MESSAGE:
+        if msg_type == config.AUCTION_JOIN_MESSAGE:
             return self._handle_join(parts, conn, joined_auctions)
-        if msg_type == config.WORKER_BID_MESSAGE:
+        if msg_type == config.AUCTION_BID_MESSAGE:
             return self._handle_bid(parts, conn, joined_auctions)
-        if msg_type == config.WORKER_STATUS_MESSAGE:
+        if msg_type == config.AUCTION_STATUS_MESSAGE:
             return self._handle_status(parts)
         return "ERROR:UNKNOWN_COMMAND"
 
@@ -157,7 +171,7 @@ class AuctionWorkerServer:
         # Broadcast highest bid update to participants.
         if broadcast:
             self._broadcast_bid_update(*broadcast)
-        # todo: update the info to leader    
+            self.notify_bid_update(*broadcast)
         return response
 
     def _handle_status(self, parts):
@@ -198,6 +212,7 @@ class AuctionWorkerServer:
 
         # Notify participants outside the lock to avoid blocking new bids/joins.
         self._notify_result(auction_id, auction)
+        self.notify_auction_done(auction_id)
 
     def _notify_result(self, auction_id, auction):
         """Send final result to all participants still connected to this auction."""
@@ -205,7 +220,7 @@ class AuctionWorkerServer:
             participants = self.participant_conns.get(auction_id, {}).copy()
 
         winner = auction.highest_bidder or ""
-        result = f"{config.WORKER_RESULT_MESSAGE}:{auction_id}:{winner}:{auction.highest_bid}"
+        result = f"{config.AUCTION_RESULT_MESSAGE}:{auction_id}:{winner}:{auction.highest_bid}"
 
         for client_id, conn in participants.items():
             try:
@@ -229,7 +244,7 @@ class AuctionWorkerServer:
             participants = self.participant_conns.get(auction_id, {}).copy()
 
         bidder = highest_bidder or ""
-        message = f"{config.WORKER_BID_UPDATE_MESSAGE}:{auction_id}:{highest_bid}:{bidder}"
+        message = f"{config.AUCTION_BID_UPDATE_MESSAGE}:{auction_id}:{highest_bid}:{bidder}"
 
         for client_id, conn in participants.items():
             try:
@@ -242,10 +257,38 @@ class AuctionWorkerServer:
         """Send a single line response to the client."""
         conn.sendall((message + "\n").encode())
 
+    def _register_with_leader(self):
+        if not self.leader_ip or self.port is None:
+            return
+        message = f"{config.WORKER_REGISTER_MESSAGE}:{self.worker_id}:{self.worker_ip}:{self.port}"
+        self._send_control_message(message)
+
+    def notify_auction_done(self, auction_id):
+        message = f"{config.AUCTION_DONE_MESSAGE}:{self.worker_id}:{auction_id}"
+        self._send_control_message(message)
+
+    def notify_bid_update(self, auction_id, highest_bid, highest_bidder):
+        bidder = highest_bidder or ""
+        message = (
+            f"{config.AUCTION_BID_UPDATE_MESSAGE}:{self.worker_id}:"
+            f"{auction_id}:{highest_bid}:{bidder}"
+        )
+        self._send_control_message(message)
+
+    def _send_control_message(self, message):
+        try:
+            with socket.create_connection((self.leader_ip, self.leader_port), timeout=2) as conn:
+                conn.sendall((message + "\n").encode())
+                with conn.makefile("r") as reader:
+                    reader.readline()
+        except OSError:
+            return
 
 
 if __name__ == "__main__":
-    server = AuctionWorkerServer()
+    worker_id = str(uuid.uuid4())
+    worker_ip = socket.gethostbyname(socket.gethostname())
+    server = WorkerService(worker_id, worker_ip)
     print(f"[Worker] TCP server listening on {server.host}:{server.port}")
     server.start()
     try:

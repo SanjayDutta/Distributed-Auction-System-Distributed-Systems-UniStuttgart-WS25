@@ -6,6 +6,8 @@ import uuid
 import hashlib
 import config
 from ring import Ring
+from leader import LeaderService
+from worker import WorkerService
 
 class Node:
     def __init__(self):
@@ -22,6 +24,8 @@ class Node:
         self.is_leader = False
         self.current_leader_ip = None # IP of the elected leader
         self.ring = None # Store ring instance
+        self.leader_service = None
+        self.worker_service = WorkerService(self.node_id, self.ip)
         
         # HS Algorithm State
         self.is_candidate = True 
@@ -179,7 +183,6 @@ class Node:
                     if len(parts) >= 3:
                         leader_uuid = parts[1]
                         leader_ip = parts[2]
-                        leader_ip = parts[2]
                         print(f"\n[System] ELECTION FINISHED. Leader is {leader_ip} (UUID: {leader_uuid[:8]})")
                         self.current_leader_ip = leader_ip
                         self.is_candidate = False
@@ -187,25 +190,18 @@ class Node:
                         
                         # If I am not leader, I should be a client/worker
                         if leader_uuid != self.node_id:
-                             # self.start_client() # Could trigger here, but risky in thread
-                             pass
+                             self.start_worker_service()
                         
-                elif msg_type == config.GET_AUCTIONS_MESSAGE:
-                    print("Replying with auctions")
-                    response = '"auction1": car'
-                    self.sock.sendto(response.encode(), addr)
-
-                elif msg_type == config.CREATE_AUCTION_MESSAGE:
-                    print("Create new auction")
-                    if len(parts) >= 3:
-                        item = parts[1]
-                        price = parts[2]
-
-                        print("Item, Price:", item, price)
-                        # TODO: Assign this auction to one of my servers
-
-                    response = "SUCCESS"
-                    self.sock.sendto(response.encode(), addr)
+                elif msg_type in (
+                    config.GET_AUCTIONS_MESSAGE,
+                    config.CREATE_AUCTION_MESSAGE,
+                    config.JOIN_AUCTION_MESSAGE,
+                    config.CLIENT_HELLO_MESSAGE,
+                ):
+                    if self.is_leader and self.leader_service:
+                        response = self.leader_service.handle_udp_request(msg_type, parts)
+                        if response:
+                            self.sock.sendto(response.encode(), addr)
 
             except Exception as e:
                 print(f"[Listener Error] {e}")
@@ -219,7 +215,7 @@ class Node:
         # Check if leader was found during sleep
         if self.current_leader_ip:
              print(f"[Discovery] Leader found at {self.current_leader_ip}. Stopping discovery.")
-             self.start_client()
+             self.start_worker_service()
              return
 
         # START PEER DISCOVERY
@@ -360,6 +356,9 @@ class Node:
         if not self.is_leader:
             self.is_leader = True
             print(">>> I AM THE LEADER NOW <<<")
+            self.current_leader_ip = self.ip
+            self.leader_service = LeaderService(self.ip)
+            self.leader_service.start()
             
             # Announce leadership to the world
             print(f"[Leader] Announcing victory to all nodes...")
@@ -368,6 +367,11 @@ class Node:
             
             # Start Server Logic here...
 
+    def start_worker_service(self):
+        if not self.current_leader_ip:
+            return
+        self.worker_service.start(self.current_leader_ip)
+
     def start_client(self):
         """Transition to Client Mode (Connect to Leader)."""
         print(f"--- Entering Client Mode ---")
@@ -375,6 +379,7 @@ class Node:
         # TODO: Implement TCP Client Connection logic here
         while self.running:
              time.sleep(1) # Keep client alive
+
 
 if __name__ == "__main__":
     node = Node()
