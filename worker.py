@@ -8,6 +8,7 @@ from auction import Auction
 
 class AuctionWorkerServer:
     def __init__(self, host="0.0.0.0", port=None):
+        """Initialize the TCP worker server and in-memory state."""
         self.host = host
         self.port = config.WORKER_TCP_PORT if port is None else port
         self.running = True
@@ -25,12 +26,14 @@ class AuctionWorkerServer:
         self.port = self.sock.getsockname()[1]
 
     def start(self):
+        """Start accepting TCP connections in a background thread."""
         # Accept connections in the background so the main thread can do other work.
         accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         accept_thread.start()
         return accept_thread
 
     def stop(self):
+        """Stop the server and close the listening socket."""
         self.running = False
         try:
             self.sock.close()
@@ -38,6 +41,7 @@ class AuctionWorkerServer:
             pass
 
     def _accept_loop(self):
+        """Accept incoming TCP connections and spawn a handler thread per client."""
         while self.running:
             try:
                 conn, addr = self.sock.accept()
@@ -51,6 +55,7 @@ class AuctionWorkerServer:
             handler_thread.start()
 
     def _handle_client(self, conn, addr):
+        """Handle a single client connection using a line-based request protocol."""
         # Track auctions joined by this connection so we can clean up on disconnect.
         joined_auctions = {}
         try:
@@ -64,9 +69,10 @@ class AuctionWorkerServer:
                     if response:
                         self._send_line(conn, response)
         finally:
-            self._remove_connection(conn, joined_auctions)
+            self._cleanup_disconnected_client(conn, joined_auctions)
 
     def _handle_command(self, line, conn, joined_auctions):
+        """Parse a single request line and dispatch to the correct handler."""
         parts = line.split(":")
         msg_type = parts[0]
 
@@ -81,6 +87,7 @@ class AuctionWorkerServer:
         return "ERROR:UNKNOWN_COMMAND"
 
     def _handle_create(self, parts, conn, joined_auctions):
+        """Create a new auction and optionally auto-join the creator."""
         if len(parts) < 4:
             return "ERROR:BAD_REQUEST"
         auction_id = parts[1]
@@ -105,6 +112,7 @@ class AuctionWorkerServer:
         return f"OK:{auction_id}"
 
     def _handle_join(self, parts, conn, joined_auctions):
+        """Register a client as a participant for a given auction."""
         if len(parts) < 3:
             return "ERROR:BAD_REQUEST"
         auction_id = parts[1]
@@ -123,12 +131,15 @@ class AuctionWorkerServer:
         return "OK"
 
     def _handle_bid(self, parts, conn, joined_auctions):
+        """Place a bid on an auction and update highest bid if valid."""
         if len(parts) < 4:
             return "ERROR:BAD_REQUEST"
         auction_id = parts[1]
         client_id = parts[2]
         amount = parts[3]
 
+        response = None
+        broadcast = None
         with self.lock:
             auction = self.auctions.get(auction_id)
             if auction is None:
@@ -139,10 +150,18 @@ class AuctionWorkerServer:
             if ok:
                 self.participant_conns.setdefault(auction_id, {})[client_id] = conn
                 joined_auctions[auction_id] = client_id
-                return f"OK:{auction.highest_bid}"
-            return "REJECT:LOW_BID"
+                response = f"OK:{auction.highest_bid}"
+                broadcast = (auction_id, auction.highest_bid, auction.highest_bidder)
+            else:
+                response = "REJECT:LOW_BID"
+        # Broadcast highest bid update to participants.
+        if broadcast:
+            self._broadcast_bid_update(*broadcast)
+        # todo: update the info to leader    
+        return response
 
     def _handle_status(self, parts):
+        """Return current status of an auction (open/closed, highest bid, winner)."""
         if len(parts) < 2:
             return "ERROR:BAD_REQUEST"
         auction_id = parts[1]
@@ -156,6 +175,7 @@ class AuctionWorkerServer:
             return f"STATUS:{status}:{auction.highest_bid}:{winner}"
 
     def _schedule_close(self, auction_id, end_time):
+        """Start a timer thread to close the auction at its deadline."""
         if end_time is None:
             return
         # One timer thread per auction to close it at the deadline.
@@ -168,6 +188,7 @@ class AuctionWorkerServer:
         thread.start()
 
     def _close_after_delay(self, auction_id, delay):
+        """Sleep until the deadline, then close the auction and notify participants."""
         time.sleep(delay)
         with self.lock:
             auction = self.auctions.get(auction_id)
@@ -179,6 +200,7 @@ class AuctionWorkerServer:
         self._notify_result(auction_id, auction)
 
     def _notify_result(self, auction_id, auction):
+        """Send final result to all participants still connected to this auction."""
         with self.lock:
             participants = self.participant_conns.get(auction_id, {}).copy()
 
@@ -193,15 +215,33 @@ class AuctionWorkerServer:
                 with self.lock:
                     self.participant_conns.get(auction_id, {}).pop(client_id, None)
 
-    def _remove_connection(self, conn, joined_auctions):
+    def _cleanup_disconnected_client(self, conn, joined_auctions):
+        """Remove a disconnected client's socket from all auction participant maps."""
         with self.lock:
             for auction_id, client_id in joined_auctions.items():
                 conns = self.participant_conns.get(auction_id)
                 if conns and conns.get(client_id) is conn:
-                    conns.pop(client_id, None)
+                    conns.pop(client_id, None) # remove C1 -> conn1 from participant_conns A1
+
+    def _broadcast_bid_update(self, auction_id, highest_bid, highest_bidder):
+        """Broadcast highest bid updates to all participants of the auction."""
+        with self.lock:
+            participants = self.participant_conns.get(auction_id, {}).copy()
+
+        bidder = highest_bidder or ""
+        message = f"{config.WORKER_BID_UPDATE_MESSAGE}:{auction_id}:{highest_bid}:{bidder}"
+
+        for client_id, conn in participants.items():
+            try:
+                self._send_line(conn, message)
+            except OSError:
+                with self.lock:
+                    self.participant_conns.get(auction_id, {}).pop(client_id, None)
 
     def _send_line(self, conn, message):
+        """Send a single line response to the client."""
         conn.sendall((message + "\n").encode())
+
 
 
 if __name__ == "__main__":
