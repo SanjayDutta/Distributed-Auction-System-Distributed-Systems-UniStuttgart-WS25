@@ -2,6 +2,8 @@ import socket
 import random
 import time
 import threading
+import json
+
 import config
 
 class Client:
@@ -20,6 +22,8 @@ class Client:
 
         self.running = True
 
+        self.auction_sock = None
+
     def start(self):
         listener_thread = threading.Thread(target=self.listen_for_broadcasts, daemon=True)
         listener_thread.start()
@@ -34,8 +38,10 @@ class Client:
         while not self.global_leader_ip:
             time.sleep(1)
 
+        auctions = {}
+
         while self.running:
-            choice = input("\nOptions:\n  [1] List existing auctions\n  [2] Create a new auction\n> ")
+            choice = input("\nOptions:\n  [1] List existing auctions\n  [2] Join auction\n  [3] Create a new auction\n> ")
 
             choice = choice.strip()
             if not choice.isdigit():                
@@ -43,31 +49,68 @@ class Client:
 
             if choice == "1":
                 print("List existing auctions")
-                self.list_existing_auctions()
+                auctions = self.list_existing_auctions()
             
             elif choice == "2":
+                print("Join auction")
+
+                auction_input_map = {}
+                for i, key in enumerate(auctions.keys()):
+                    auction_input_map[i] = {"auction_id": key, **auctions[key]}
+                    print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
+                    
+                auction_input = input("Select auction number: ")
+
+                if not auction_input.isdigit():
+                    continue
+
+                auction_index = int(auction_input)
+                print(auction_input_map)
+
+                if auction_index not in auction_input_map:
+                    continue
+
+                auction_to_join = auction_input_map[auction_index]
+
+                self.join_auction(auction_to_join['auction_id'], auction_to_join['worker_ip'], auction_to_join['worker_port'])
+
+            elif choice == "3":
                 print("Create new auction")
                 self.create_new_auction()
 
     def list_existing_auctions(self):
         
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client_sock.settimeout(5)
         client_sock.sendto(config.GET_AUCTIONS_MESSAGE.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
-
+        print("wait for result")
         try:
             data, addr = client_sock.recvfrom(1024)
         except Exception as e:
             print("Failed to get auctions from global leader:", e)
             return
         
-        auctions = data.decode()
+        message = data.decode()
+        parts = message.split(":", 1)
+        result = parts[0]
+
+        if result != "AUCTION_LIST":
+            print("Failed to get the auction list, response was:", message)
+
+        if len(parts) >= 2:
+            auctions = json.loads(parts[1])
 
         print("Auctions:", auctions)
+
+        return auctions
 
     def create_new_auction(self):
         
         item = input("Item to sell: ")
         price = input("Starting bid: ")
+
+        while not price.isdigit():
+            price = input("Enter a real number for starting bid: ")
 
         message = ":".join([
             config.CREATE_AUCTION_MESSAGE,
@@ -76,6 +119,7 @@ class Client:
         ])
 
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client_sock.settimeout(5)
         client_sock.sendto(message.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
 
         try:
@@ -84,12 +128,93 @@ class Client:
             print("Failed to get auctions from global leader:", e)
             return
         
-        result = data.decode()
-
+        message = data.decode('utf-8')
+    
+        parts = message.split(":")
+        result = parts[0]
+        
+        # SUCCESS:978594d9-2eac-4161-98a7-32eae24d0a8a:192.168.0.80:58902
         if result == "SUCCESS":
             print("Auction created successfully")
+            auction_id = parts[1]
+            server_ip = parts[2]
+            server_port = int(parts[3])
+
+            print(parts)
+            self.join_auction(auction_id, server_ip, server_port)
+
         else:
-            print("Failed to create auction, message from global leader was:", result)
+            print("Failed to create auction, message from global leader was:", message)
+
+    def join_auction(self, auction_id, server_ip, server_port):
+
+        message = config.JOIN_AUCTION_MESSAGE + ":" + auction_id
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client_sock.settimeout(5)
+        client_sock.sendto(message.encode(), (server_ip, server_port))
+
+        try:
+            data, addr = client_sock.recvfrom(1024)
+        except Exception as e:
+            print("Failed to join auction:", e)
+            return
+        
+        message = data.decode('utf-8')
+    
+        parts = message.split(":")
+        result = parts[0]
+
+        print(parts)
+        if result != "OK":
+            print("Failed to join auction, response was:", message)
+            return
+
+        self.auction_sock = client_sock
+        listener_thread = threading.Thread(target=self.listen_for_auction_messages, daemon=True)
+        listener_thread.start()
+
+        auction_running = True
+
+        while auction_running:
+            new_bid = input("Add bid: ")
+
+            message = ":".join([
+                config.AUCTION_BID_MESSAGE,
+                auction_id,
+                new_bid
+            ])
+                
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client_sock.settimeout(5)
+            client_sock.sendto(message.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
+
+            try:
+                data, addr = client_sock.recvfrom(1024)
+            except Exception as e:
+                print("Failed to get auctions from global leader:", e)
+                return
+            
+            message = data.decode('utf-8')
+
+
+    # def listen_for_auction_messages(self):
+        
+    #     while True:
+    #         try:
+    #             data, addr = self.auction_sock.recvfrom(1024)
+    #         except Exception as e:
+    #             print("Failed to listen to auction messages:", e)
+    #             return
+
+
+    #         message = data.decode('utf-8')
+    #         parts = message.split(":")
+    #         result = parts[0]
+
+    #         print(parts)
+    #         if result != "OK":
+    #             print("Failed to join auction")
+    #             # return
 
 
     def listen_for_broadcasts(self):

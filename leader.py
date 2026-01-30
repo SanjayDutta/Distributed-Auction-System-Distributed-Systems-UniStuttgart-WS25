@@ -74,23 +74,28 @@ class LeaderService:
     def create_auction(self, item, starting_bid, creator_id=None):
         auction_id = str(uuid.uuid4())
         worker = self._allocate_worker(auction_id)
+        print(worker)
         if not worker:
             return None
 
         ok = self._send_worker_create(worker, auction_id, item, starting_bid, creator_id)
+        print("ok", ok)
+
         if not ok:
             self._release_worker(worker["id"], auction_id)
             return None
 
         with self.lock:
             self.auction_map[auction_id] = worker["id"]
+            self.auction_status[auction_id] = {"item": item, "highest_bid": starting_bid}
         print(f"[Leader] Created auction {auction_id} on worker {worker['id']}")
         return auction_id, worker["ip"], worker["port"]
 
     def handle_udp_request(self, msg_type, parts):
         """Handle client UDP requests and return a response string."""
         if msg_type == config.GET_AUCTIONS_MESSAGE:
-            return str(self.list_auctions())
+            payload = self.list_auctions_with_status()
+            return f"{config.AUCTION_LIST_MESSAGE}:{json.dumps(payload)}"
         if msg_type == config.CLIENT_HELLO_MESSAGE:
             payload = self.list_auctions_with_status()
             return f"{config.AUCTION_LIST_MESSAGE}:{json.dumps(payload)}"
@@ -213,6 +218,7 @@ class LeaderService:
                     "worker_port": worker["port"],
                     "highest_bid": status.get("highest_bid"),
                     "highest_bidder": status.get("highest_bidder"),
+                    "item": status.get("item")
                 }
             return result
 

@@ -1,6 +1,6 @@
 # Ports
 BROADCAST_PORT = 5005
-WORKER_TCP_PORT = 0
+WORKER_TCP_PORT = 7001
 LEADER_TCP_PORT = 7000
 
 # Discovery / peer messages (UDP broadcast)

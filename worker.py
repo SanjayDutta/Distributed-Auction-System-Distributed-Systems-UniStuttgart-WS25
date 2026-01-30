@@ -30,7 +30,7 @@ class WorkerService:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
         self.sock.listen()
-        self.port = self.sock.getsockname()[1]
+        # self.port = self.sock.getsockname()[1]
 
     def start(self, leader_ip=None):
         """Start accepting TCP connections and optionally register with leader."""
@@ -131,6 +131,8 @@ class WorkerService:
             return "ERROR:BAD_REQUEST"
         auction_id = parts[1]
         client_id = parts[2]
+        
+        print("????????????????", parts)
 
         with self.lock:
             auction = self.auctions.get(auction_id)
@@ -141,6 +143,7 @@ class WorkerService:
             auction.add_participant(client_id)
             self.participant_conns.setdefault(auction_id, {})[client_id] = conn
             joined_auctions[auction_id] = client_id
+
 
         return "OK"
 

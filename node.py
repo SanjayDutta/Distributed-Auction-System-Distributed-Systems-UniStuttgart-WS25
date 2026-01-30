@@ -25,7 +25,7 @@ class Node:
         self.current_leader_ip = None # IP of the elected leader
         self.ring = None # Store ring instance
         self.leader_service = None
-        self.worker_service = WorkerService(self.node_id, self.ip)
+        self.worker_service = None
         
         # HS Algorithm State
         self.is_candidate = True 
@@ -370,16 +370,9 @@ class Node:
     def start_worker_service(self):
         if not self.current_leader_ip:
             return
+        if not self.worker_service:
+            self.worker_service = WorkerService(self.node_id, self.ip)
         self.worker_service.start(self.current_leader_ip)
-
-    def start_client(self):
-        """Transition to Client Mode (Connect to Leader)."""
-        print(f"--- Entering Client Mode ---")
-        print(f"Connecting to Leader at {self.current_leader_ip}...")
-        # TODO: Implement TCP Client Connection logic here
-        while self.running:
-             time.sleep(1) # Keep client alive
-
 
 if __name__ == "__main__":
     node = Node()
