@@ -213,7 +213,7 @@ class Node:
         time.sleep(2) 
         
         # Check if leader was found during sleep
-        if self.current_leader_ip:
+        if self.current_leader_ip and not self.is_leader:
              print(f"[Discovery] Leader found at {self.current_leader_ip}. Stopping discovery.")
              self.start_worker_service()
              return

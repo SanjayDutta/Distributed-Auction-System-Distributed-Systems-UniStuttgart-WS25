@@ -153,58 +153,85 @@ class Client:
 
     def join_auction(self, auction_id, server_ip, server_port):
 
-        message = config.AUCTION_JOIN_MESSAGE + ":" + auction_id + ":" + self.client_id
+        message = config.AUCTION_JOIN_MESSAGE + ":" + auction_id + ":" + self.client_id + "\n"
         
         print("try join auction", message)
 
-        client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client_sock.settimeout(5)
-        client_sock.sendto(message.encode(), (server_ip, server_port))
-
         try:
-            data, addr = client_sock.recvfrom(1024)
+            auction_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            auction_sock.settimeout(5)
+            auction_sock.connect((server_ip, server_port))
+
+            auction_sock.sendall(message.encode())
+
+            data = auction_sock.recv(1024)
         except Exception as e:
             print("Failed to join auction:", e)
             return
         
-        message = data.decode('utf-8')
+        msg = data.decode('utf-8')
     
-        parts = message.split(":")
+        parts = msg.strip().split(":")
         result = parts[0]
 
         print(parts)
         if result != "OK":
-            print("Failed to join auction, response was:", message)
+            print("Failed to join auction, response was:", msg)
             return
 
-        self.auction_sock = client_sock
-        listener_thread = threading.Thread(target=self.listen_for_auction_messages, daemon=True)
-        listener_thread.start()
+        # self.auction_sock = client_sock
+        # listener_thread = threading.Thread(target=self.listen_for_auction_messages, daemon=True)
+        # listener_thread.start()
 
         auction_running = True
 
-        highest_bid = 0
+        highest_bid = 10
 
         while auction_running:
             new_bid = input("Add bid: ")
 
+            if not new_bid.isdigit():
+                continue
+
+            if float(new_bid) < highest_bid:
+                continue
+
             message = ":".join([
                 config.AUCTION_BID_MESSAGE,
                 auction_id,
-                new_bid
-            ])
-                
-            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            client_sock.settimeout(5)
-            client_sock.sendto(message.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
+                self.client_id,
+                str(new_bid)
+            ]) + "\n"
+
+            auction_sock.sendall(message.encode())
 
             try:
-                data, addr = client_sock.recvfrom(1024)
+                response = auction_sock.recv(1024).decode('utf-8')
             except Exception as e:
                 print("Failed to send highest bid:", e)
                 continue
             
-            message = data.decode('utf-8')
+            print(response)
+
+            parts = response.strip().split(":")
+            result = parts[0]
+
+            if len(parts) < 2:
+                continue
+            
+            if result == "OK":
+                print("New highest bid: ", parts[1])
+                highest_bid = float(parts[1])
+
+            elif result == "REJECT" and parts[1] == "LOW_BID":
+                print(f"Bid {new_bid} was too low!")
+
+            if len(parts) < 3:
+                continue
+            
+            if result == "AUCTION_BID_UPDATE":
+                print(f"New highest bid:", parts[2])
+                highest_bid = float(parts[2])
 
 
 
