@@ -72,12 +72,29 @@ class WorkerService:
         """Handle a single client connection using a line-based request protocol."""
         # Track auctions joined by this connection so we can clean up on disconnect.
         joined_auctions = {}
-        try:
+        print("hello????????????????????????? handle_client")
+        # while True:
+                
+            # try:
+            #     print("type", type(conn), conn)
+            #     data, addr = conn.recvfrom(1024)
+            #     print("GOT", data.decode().strip()) 
+            #     response = self._handle_command(data.decode().strip(), conn, joined_auctions)
+            #     if response:
+            #         self._send_line(conn, response)
+    
+                
+            # except Exception as e:
+            #     print("Failed to handle client", e)
+            #     return
+        try:     
             # Line-based protocol: each request is one line, colon-delimited fields.
             with conn, conn.makefile("r") as reader:
                 for line in reader:
+                    print("line", line)
                     line = line.strip()
                     if not line:
+                        print("skipping")
                         continue
                     response = self._handle_command(line, conn, joined_auctions)
                     if response:
@@ -85,10 +102,13 @@ class WorkerService:
         finally:
             self._cleanup_disconnected_client(conn, joined_auctions)
 
+
     def _handle_command(self, line, conn, joined_auctions):
         """Parse a single request line and dispatch to the correct handler."""
         parts = line.split(":")
         msg_type = parts[0]
+
+        print("HANDLE COMMAND", msg_type)
 
         if msg_type == config.AUCTION_CREATE_MESSAGE:
             return self._handle_create(parts, conn, joined_auctions)
@@ -98,6 +118,8 @@ class WorkerService:
             return self._handle_bid(parts, conn, joined_auctions)
         if msg_type == config.AUCTION_STATUS_MESSAGE:
             return self._handle_status(parts)
+        
+        print("RETURNING ERROR")
         return "ERROR:UNKNOWN_COMMAND"
 
     def _handle_create(self, parts, conn, joined_auctions):
@@ -132,7 +154,7 @@ class WorkerService:
         auction_id = parts[1]
         client_id = parts[2]
         
-        print("????????????????", parts)
+        print("???????????????? handle join", parts)
 
         with self.lock:
             auction = self.auctions.get(auction_id)

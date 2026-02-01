@@ -372,7 +372,7 @@ class Node:
             return
         if not self.worker_service:
             self.worker_service = WorkerService(self.node_id, self.ip)
-        self.worker_service.start(self.current_leader_ip)
+            self.worker_service.start(self.current_leader_ip)
 
 if __name__ == "__main__":
     node = Node()

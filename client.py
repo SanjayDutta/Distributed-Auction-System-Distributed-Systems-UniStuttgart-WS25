@@ -55,6 +55,11 @@ class Client:
                 print("Join auction")
 
                 auction_input_map = {}
+
+                if auctions is None or not len(auctions.keys()):
+                    print("No auctions available")
+                    continue
+
                 for i, key in enumerate(auctions.keys()):
                     auction_input_map[i] = {"auction_id": key, **auctions[key]}
                     print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
@@ -148,7 +153,10 @@ class Client:
 
     def join_auction(self, auction_id, server_ip, server_port):
 
-        message = config.JOIN_AUCTION_MESSAGE + ":" + auction_id
+        message = config.AUCTION_JOIN_MESSAGE + ":" + auction_id + ":" + self.client_id
+        
+        print("try join auction", message)
+
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client_sock.settimeout(5)
         client_sock.sendto(message.encode(), (server_ip, server_port))
@@ -175,6 +183,8 @@ class Client:
 
         auction_running = True
 
+        highest_bid = 0
+
         while auction_running:
             new_bid = input("Add bid: ")
 
@@ -191,10 +201,11 @@ class Client:
             try:
                 data, addr = client_sock.recvfrom(1024)
             except Exception as e:
-                print("Failed to get auctions from global leader:", e)
-                return
+                print("Failed to send highest bid:", e)
+                continue
             
             message = data.decode('utf-8')
+
 
 
     # def listen_for_auction_messages(self):
