@@ -189,6 +189,7 @@ class LeaderService:
         if creator_id:
             message_parts.append(creator_id)
         message = ":".join(message_parts)
+        print(message)
 
         try:
             with socket.create_connection((worker["ip"], worker["port"]), timeout=2) as conn:

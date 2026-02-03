@@ -18,6 +18,7 @@ class Auction:
             else None
         )
         self.participants = set()
+        self.auction_sequence_number = 0
 
     def is_open(self):
         if self.status != "open":

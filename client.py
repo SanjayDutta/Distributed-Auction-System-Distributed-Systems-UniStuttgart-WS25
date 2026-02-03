@@ -24,6 +24,10 @@ class Client:
 
         self.auction_sock = None
 
+        self.auction_running = False
+
+        self.auction_sequence_number = 0
+
     def start(self):
         listener_thread = threading.Thread(target=self.listen_for_broadcasts, daemon=True)
         listener_thread.start()
@@ -37,8 +41,10 @@ class Client:
 
         while not self.global_leader_ip:
             time.sleep(1)
-
-        auctions = {}
+        
+        auctions = self.list_existing_auctions()
+        
+        auction_input_map = {}
 
         while self.running:
             choice = input("\nOptions:\n  [1] List existing auctions\n  [2] Join auction\n  [3] Create a new auction\n> ")
@@ -52,23 +58,23 @@ class Client:
                 auctions = self.list_existing_auctions()
             
             elif choice == "2":
+                if not auctions:
+                    continue
                 print("Join auction")
 
-                auction_input_map = {}
-
-                if auctions is None or not len(auctions.keys()):
-                    print("No auctions available")
-                    continue
-
-                for i, key in enumerate(auctions.keys()):
-                    auction_input_map[i] = {"auction_id": key, **auctions[key]}
-                    print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
-                    
                 auction_input = input("Select auction number: ")
 
                 if not auction_input.isdigit():
                     continue
 
+                if auctions is None or not len(auctions.keys()):
+                    print("\nNo auctions available")
+                    continue
+
+                for i, key in enumerate(auctions.keys()):
+                    auction_input_map[i] = {"auction_id": key, **auctions[key]}
+                    print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
+        
                 auction_index = int(auction_input)
                 print(auction_input_map)
 
@@ -77,6 +83,7 @@ class Client:
 
                 auction_to_join = auction_input_map[auction_index]
 
+                self.highest_bid = auction_to_join['highest_bid']
                 self.join_auction(auction_to_join['auction_id'], auction_to_join['worker_ip'], auction_to_join['worker_port'])
 
             elif choice == "3":
@@ -105,8 +112,15 @@ class Client:
         if len(parts) >= 2:
             auctions = json.loads(parts[1])
 
-        print("Auctions:", auctions)
+        auction_input_map = {}
 
+        if auctions is None or not len(auctions.keys()):
+            print("\nNo auctions available")
+        else:
+            for i, key in enumerate(auctions.keys()):
+                auction_input_map[i] = {"auction_id": key, **auctions[key]}
+                print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
+            
         return auctions
 
     def create_new_auction(self):
@@ -145,7 +159,8 @@ class Client:
             server_ip = parts[2]
             server_port = int(parts[3])
 
-            print(parts)
+            # print(parts)
+            self.highest_bid = price
             self.join_auction(auction_id, server_ip, server_port)
 
         else:
@@ -178,81 +193,128 @@ class Client:
         if result != "OK":
             print("Failed to join auction, response was:", msg)
             return
+        
+        if len(parts) < 2:
+            return
+        self.auction_sequence_number = int(parts[1])
 
-        # self.auction_sock = client_sock
-        # listener_thread = threading.Thread(target=self.listen_for_auction_messages, daemon=True)
-        # listener_thread.start()
+        self.auction_sock = auction_sock
+        
+        self.auction_running = True
+        listener_thread = threading.Thread(target=self.listen_for_auction_messages, daemon=True)
+        listener_thread.start()
 
-        auction_running = True
-
-        highest_bid = 10
-
-        while auction_running:
-            new_bid = input("Add bid: ")
+        while self.auction_running:
+            new_bid = input(f"Add bid (current: {self.highest_bid}): ")
 
             if not new_bid.isdigit():
                 continue
 
-            if float(new_bid) < highest_bid:
+            if float(new_bid) < float(self.highest_bid):
                 continue
 
             message = ":".join([
                 config.AUCTION_BID_MESSAGE,
                 auction_id,
                 self.client_id,
-                str(new_bid)
+                str(new_bid),
+                str(self.auction_sequence_number + 1)
             ]) + "\n"
 
-            auction_sock.sendall(message.encode())
-
+            print("sending...")
             try:
-                response = auction_sock.recv(1024).decode('utf-8')
+                auction_sock.sendall(message.encode())
             except Exception as e:
-                print("Failed to send highest bid:", e)
-                continue
+                print("Failed to send message:", e)
+                return
+
+            # try:
+            #     response = auction_sock.recv(1024).decode('utf-8')
+            # except Exception as e:
+            #     print("Failed to send highest bid:", e)
+            #     continue
             
-            print(response)
+            # print(response)
 
-            parts = response.strip().split(":")
-            result = parts[0]
+            # parts = response.strip().split(":")
+            # result = parts[0]
 
-            if len(parts) < 2:
-                continue
+            # if len(parts) < 2:
+            #     continue
             
-            if result == "OK":
-                print("New highest bid: ", parts[1])
-                highest_bid = float(parts[1])
+            # if result == "OK":
+            #     print("New highest bid: ", parts[1])
+            #     self.highest_bid = float(parts[1])
 
-            elif result == "REJECT" and parts[1] == "LOW_BID":
-                print(f"Bid {new_bid} was too low!")
+            # elif result == "REJECT" and parts[1] == "LOW_BID":
+            #     print(f"Bid {new_bid} was too low!")
 
-            if len(parts) < 3:
-                continue
+            # if len(parts) < 3:
+            #     continue
             
-            if result == "AUCTION_BID_UPDATE":
-                print(f"New highest bid:", parts[2])
-                highest_bid = float(parts[2])
+            # if result == "AUCTION_BID_UPDATE":
+            #     print(f"New highest bid:", parts[2])
+            #     highest_bid = float(parts[2])
 
 
 
-    # def listen_for_auction_messages(self):
+    def listen_for_auction_messages(self):
         
-    #     while True:
-    #         try:
-    #             data, addr = self.auction_sock.recvfrom(1024)
-    #         except Exception as e:
-    #             print("Failed to listen to auction messages:", e)
-    #             return
+        while self.auction_running:
+            try:
+                data = self.auction_sock.recv(1024)
+            except Exception as e:
+                continue
+                #print("Failed to listen to auction messages:", e)
 
+            message = data.decode('utf-8').strip()
+            parts = message.split(":")
+            result = parts[0]
+            # print("GOT MESSAGE", message)
 
-    #         message = data.decode('utf-8')
-    #         parts = message.split(":")
-    #         result = parts[0]
+            #print(parts)
+            if result == config.AUCTION_BID_UPDATE_MESSAGE:
+                if len(parts) < 4:
+                    continue
 
-    #         print(parts)
-    #         if result != "OK":
-    #             print("Failed to join auction")
-    #             # return
+                self.highest_bid = parts[2]
+                highest_bidder = parts[3]
+                self.auction_sequence_number = int(parts[4])
+
+                print(f"\n{highest_bidder} just made the highest bid {self.highest_bid}!")
+                
+            elif result == "OK":
+                if len(parts) < 3:
+                    continue
+                self.highest_bid = parts[1]
+                self.auction_sequence_number = int(parts[2])
+
+                print("\nYour bid was accepted!")
+                print("New highest bid:", self.highest_bid)
+
+            elif result == "REJECT":
+                if parts[1] == "LOW_BID":
+                    print(f"\nYour bid was too low!")
+                elif parts[1] == "MSG_OUT_OF_ORDER":
+                    print("Someone else sent a bid earlier!")
+
+            elif result == config.AUCTION_RESULT_MESSAGE:
+
+                if len(parts) < 4:
+                    continue
+                winner = parts[2]
+                winning_bid = parts[3]
+                if winner == self.client_id:
+                    winner += " (you)"
+
+                print("\n**********\n\nAuction has finished!\n")
+                print("Winner:", winner, "with the bid", winning_bid)
+                self.auction_running = False
+
+            # if result != "OK":
+                # print("Failed to join auction")
+                # return
+
 
 
     def listen_for_broadcasts(self):

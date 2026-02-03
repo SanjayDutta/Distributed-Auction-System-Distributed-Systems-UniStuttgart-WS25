@@ -154,7 +154,7 @@ class WorkerService:
         auction_id = parts[1]
         client_id = parts[2]
         
-        print("???????????????? handle join", parts)
+        # print("???????????????? handle join", parts)
 
         with self.lock:
             auction = self.auctions.get(auction_id)
@@ -166,16 +166,17 @@ class WorkerService:
             self.participant_conns.setdefault(auction_id, {})[client_id] = conn
             joined_auctions[auction_id] = client_id
 
-
-        return "OK"
+        auction_sequence_number = auction.auction_sequence_number
+        return f"OK:{auction_sequence_number}"
 
     def _handle_bid(self, parts, conn, joined_auctions):
         """Place a bid on an auction and update highest bid if valid."""
-        if len(parts) < 4:
+        if len(parts) < 5:
             return "ERROR:BAD_REQUEST"
         auction_id = parts[1]
         client_id = parts[2]
         amount = parts[3]
+        auction_sequence_number = int(parts[4])
 
         response = None
         broadcast = None
@@ -185,14 +186,18 @@ class WorkerService:
                 return "ERROR:NOT_FOUND"
             if not auction.is_open():
                 return "ERROR:CLOSED"
+            if auction_sequence_number < auction.auction_sequence_number:
+                return "ERROR:MSG_OUT_OF_ORDER"
+            
             ok = auction.place_bid(client_id, amount)
+            auction.auction_sequence_number += 1
             if ok:
                 self.participant_conns.setdefault(auction_id, {})[client_id] = conn
                 joined_auctions[auction_id] = client_id
-                response = f"OK:{auction.highest_bid}"
-                broadcast = (auction_id, auction.highest_bid, auction.highest_bidder)
+                response = f"OK:{auction.highest_bid}:{auction.auction_sequence_number}"
+                broadcast = (auction_id, auction.highest_bid, auction.highest_bidder, auction.auction_sequence_number)
             else:
-                response = "REJECT:LOW_BID"
+                response = f"REJECT:LOW_BID:{auction.auction_sequence_number}"
         # Broadcast highest bid update to participants.
         if broadcast:
             self._broadcast_bid_update(*broadcast)
@@ -263,13 +268,13 @@ class WorkerService:
                 if conns and conns.get(client_id) is conn:
                     conns.pop(client_id, None) # remove C1 -> conn1 from participant_conns A1
 
-    def _broadcast_bid_update(self, auction_id, highest_bid, highest_bidder):
+    def _broadcast_bid_update(self, auction_id, highest_bid, highest_bidder, auction_sequence_number):
         """Broadcast highest bid updates to all participants of the auction."""
         with self.lock:
             participants = self.participant_conns.get(auction_id, {}).copy()
 
         bidder = highest_bidder or ""
-        message = f"{config.AUCTION_BID_UPDATE_MESSAGE}:{auction_id}:{highest_bid}:{bidder}"
+        message = f"{config.AUCTION_BID_UPDATE_MESSAGE}:{auction_id}:{highest_bid}:{bidder}:{auction_sequence_number}"
 
         for client_id, conn in participants.items():
             try:
@@ -292,11 +297,11 @@ class WorkerService:
         message = f"{config.AUCTION_DONE_MESSAGE}:{self.worker_id}:{auction_id}"
         self._send_control_message(message)
 
-    def notify_bid_update(self, auction_id, highest_bid, highest_bidder):
+    def notify_bid_update(self, auction_id, highest_bid, highest_bidder, auction_sequence_number):
         bidder = highest_bidder or ""
         message = (
             f"{config.AUCTION_BID_UPDATE_MESSAGE}:{self.worker_id}:"
-            f"{auction_id}:{highest_bid}:{bidder}"
+            f"{auction_id}:{highest_bid}:{bidder}:{auction_sequence_number}"
         )
         self._send_control_message(message)
 
