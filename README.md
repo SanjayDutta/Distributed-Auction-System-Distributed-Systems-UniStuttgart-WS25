@@ -20,16 +20,13 @@
 - **Test client** (`test.py`):
   - CLI commands: `hello`, `create`, `bid`, `status`.
   - Two-client workflow supported (creator listens; bidder bids higher and listens).
+- Client
+- Heartbeat from leader to worker servers
+- Heartbeat from worker servers to leader
 
 ## Not Implemented / Pending Integration
-- **Real client integration** (`client.py`):
-  - No TCP worker interaction yet (JOIN/BID/LISTEN).
-  - No handling of `AUCTION_*` messages or continuous updates.
-- **Leader-client auction list format**:
-  - `CLIENT_HELLO` returns JSON list but `client.py` does not parse it yet.
 - **Robustness / retries**:
   - UDP messages have no ACK/retry (except test client retries).
-  - No worker heartbeat or re-registration after leader change.
 - **State recovery**:
   - Target design: leader acts as the metadata center; workers manage their own auctions.
   - On leader failure, a new leader should request workers to re-report their auction lists (snapshot recovery).
