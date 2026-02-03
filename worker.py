@@ -72,7 +72,7 @@ class WorkerService:
         """Handle a single client connection using a line-based request protocol."""
         # Track auctions joined by this connection so we can clean up on disconnect.
         joined_auctions = {}
-        print("hello????????????????????????? handle_client")
+        # print("hello????????????????????????? handle_client")
         # while True:
                 
             # try:
@@ -91,10 +91,10 @@ class WorkerService:
             # Line-based protocol: each request is one line, colon-delimited fields.
             with conn, conn.makefile("r") as reader:
                 for line in reader:
-                    print("line", line)
+                    # print("line", line)
                     line = line.strip()
                     if not line:
-                        print("skipping")
+                        # print("skipping")
                         continue
                     response = self._handle_command(line, conn, joined_auctions)
                     if response:
@@ -108,7 +108,7 @@ class WorkerService:
         parts = line.split(":")
         msg_type = parts[0]
 
-        print("HANDLE COMMAND", msg_type)
+        # print("HANDLE COMMAND", msg_type)
 
         if msg_type == config.AUCTION_CREATE_MESSAGE:
             return self._handle_create(parts, conn, joined_auctions)
@@ -118,6 +118,8 @@ class WorkerService:
             return self._handle_bid(parts, conn, joined_auctions)
         if msg_type == config.AUCTION_STATUS_MESSAGE:
             return self._handle_status(parts)
+        if msg_type == config.HEARTBEAT_MESSAGE:
+            return "ALIVE"
         
         print("RETURNING ERROR")
         return "ERROR:UNKNOWN_COMMAND"
@@ -186,7 +188,7 @@ class WorkerService:
                 return "ERROR:NOT_FOUND"
             if not auction.is_open():
                 return "ERROR:CLOSED"
-            if auction_sequence_number < auction.auction_sequence_number:
+            if auction_sequence_number <= auction.auction_sequence_number:
                 return "ERROR:MSG_OUT_OF_ORDER"
             
             ok = auction.place_bid(client_id, amount)

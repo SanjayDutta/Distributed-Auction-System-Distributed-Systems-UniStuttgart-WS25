@@ -41,6 +41,8 @@ class Node:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(('', config.BROADCAST_PORT))
 
+        self.heartbeat_thread = None
+
     def start(self):
         """Start the listener thread and the main logic loop."""
         # 1. Start the Listener Thread
@@ -373,6 +375,40 @@ class Node:
         if not self.worker_service:
             self.worker_service = WorkerService(self.node_id, self.ip)
             self.worker_service.start(self.current_leader_ip)
+            
+            self.heartbeat_thread = threading.Thread(target=self.heartbeat_leader, daemon=True)
+            self.heartbeat_thread.start()
+
+    def heartbeat_leader(self):
+        """
+        Heartbeat every 5 seconds to leader.
+        If leader does not respond 3x, restart leader election
+        """
+        
+        failed_heartbeats = 0
+
+        while True:
+            time.sleep(5)
+            try:
+                with socket.create_connection((self.current_leader_ip, config.LEADER_TCP_PORT), timeout=2) as conn:
+                    conn.sendall((config.HEARTBEAT_MESSAGE + "\n").encode())
+                    with conn.makefile("r") as reader:
+                        result = reader.readline().strip()
+                    if result == "ALIVE":
+                        failed_heartbeats = 0
+                    else:
+                        print("Heartbeat result from leader was not ALIVE, but", result)
+                        failed_heartbeats += 1
+            except Exception as e:
+                failed_heartbeats += 1
+                print("Failed heartbeats to leader:", failed_heartbeats)
+
+            if failed_heartbeats >= 3:
+                print("3 heartbeats failed to leader, starting new election")
+                self.current_leader_ip = None
+                self.sock.sendto(config.ELECTION_RESTART_PREFIX.encode(), ('<broadcast>', config.BROADCAST_PORT))
+                return
+
 
 if __name__ == "__main__":
     node = Node()

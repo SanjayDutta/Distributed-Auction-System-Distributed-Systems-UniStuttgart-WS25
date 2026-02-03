@@ -1,6 +1,7 @@
 import json
 import socket
 import threading
+import time
 import uuid
 
 import config
@@ -24,6 +25,9 @@ class LeaderService:
         self.sock.bind((self.host, self.port))
         self.sock.listen()
         self.port = self.sock.getsockname()[1]
+
+        self.heartbeat_worker_thread = threading.Thread(target=self.heartbeat_worker_server, daemon=True)
+        self.heartbeat_worker_thread.start()
 
     def start(self):
         """Start the TCP control server for worker registration."""
@@ -152,6 +156,9 @@ class LeaderService:
                     "highest_bidder": highest_bidder,
                 }
             return "OK"
+        if msg_type == config.HEARTBEAT_MESSAGE:
+            return "ALIVE"
+
         return "ERROR:UNKNOWN_COMMAND"
 
     def _allocate_worker(self, auction_id):
@@ -245,3 +252,37 @@ class LeaderService:
                 response = self.handle_control_message(line)
                 if response:
                     conn.sendall((response + "\n").encode())
+
+    def heartbeat_worker_server(self):
+        """
+        Heartbeat every 5 seconds to workers.
+        If a worker does not respond 3x, re assign auctions to other workers
+        """
+        
+        failed_heartbeats = {id: 0 for id in self.worker_registry.keys()}
+
+        while True:
+            time.sleep(5)
+            for id in list(self.worker_registry.keys()):
+                try:
+                    ip = self.worker_registry[id]['ip']
+                    with socket.create_connection((ip, config.WORKER_TCP_PORT), timeout=2) as conn:
+                        conn.sendall((config.HEARTBEAT_MESSAGE + "\n").encode())
+                        with conn.makefile("r") as reader:
+                            result = reader.readline().strip()
+                        if result == "ALIVE":
+                            failed_heartbeats[id] = 0
+                        else:
+                            print("Heartbeat result from leader was not ALIVE, but", result)
+                            failed_heartbeats[id] += 1
+                except Exception as e:
+                    failed_heartbeats[id] += 1
+                    print(f"Failed heartbeats to worker {id}:", failed_heartbeats[id])
+
+                if failed_heartbeats[id] >= 3:
+                    print(f"3 heartbeats failed to worker {id}, re assigning auctions")
+                    auctions = self.worker_registry[id]['active_auctions']
+                    del self.worker_registry[id]
+
+                    for auction in auctions:
+                        self._allocate_worker(auction)
