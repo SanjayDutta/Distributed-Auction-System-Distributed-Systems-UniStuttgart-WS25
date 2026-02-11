@@ -13,7 +13,7 @@ import config
 
 
 class LeaderService:
-    def __init__(self, host, port=None):
+    def __init__(self, host, port=None, recover_from_worker_id=None):
         self.host = host
         self.port = config.LEADER_TCP_PORT if port is None else port
         self.running = False
@@ -24,6 +24,9 @@ class LeaderService:
         self.auction_map = {}
         # auction_id -> {"highest_bid": str, "highest_bidder": str}
         self.auction_status = {}
+        
+        # Store worker_id for auction recovery (when worker becomes leader)
+        self.recover_from_worker_id = recover_from_worker_id
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -40,6 +43,13 @@ class LeaderService:
         self.running = True
         accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         accept_thread.start()
+        
+        # If we have auctions to recover (worker became leader), trigger recovery
+        if self.recover_from_worker_id:
+            print(f"[Leader] Detected auction data from worker {self.recover_from_worker_id[:8]}, triggering recovery...")
+            recovery_thread = threading.Thread(target=self.trigger_auction_recovery, daemon=True)
+            recovery_thread.start()
+        
         return accept_thread
 
     def stop(self):
@@ -50,13 +60,31 @@ class LeaderService:
         except OSError:
             pass
 
-    def register_worker(self, worker_id, worker_ip, worker_port):
+    def register_worker(self, worker_id, worker_ip, worker_port, auction_inventory=None):
         with self.lock:
             self.worker_registry[worker_id] = {
                 "ip": worker_ip,
                 "port": int(worker_port),
                 "active_auctions": set(),
             }
+            
+            # Rebuild auction_map and auction_status from worker's inventory
+            if auction_inventory:
+                print(f"[Leader] Rebuilding auction state from worker {worker_id[:8]} - {len(auction_inventory)} auctions")
+                for auction_data in auction_inventory:
+                    auction_id = auction_data.get("auction_id")
+                    if auction_id:
+                        # Add to auction_map
+                        self.auction_map[auction_id] = worker_id
+                        self.worker_registry[worker_id]["active_auctions"].add(auction_id)
+                        
+                        # Rebuild auction_status
+                        self.auction_status[auction_id] = {
+                            "item": auction_data.get("item"),
+                            "highest_bid": auction_data.get("highest_bid"),
+                            "highest_bidder": auction_data.get("highest_bidder"),
+                        }
+                        print(f"[Leader] Restored auction {auction_id[:8]} on worker {worker_id[:8]}")
 
     def mark_auction_done(self, worker_id, auction_id):
         with self.lock:
@@ -140,7 +168,17 @@ class LeaderService:
             worker_id = parts[1]
             worker_ip = parts[2]
             worker_port = parts[3]
-            self.register_worker(worker_id, worker_ip, worker_port)
+            
+            # Parse auction inventory if provided (for leader failover)
+            auction_inventory = []
+            if len(parts) >= 5:
+                try:
+                    auction_json = ":".join(parts[4:])  # Rejoin in case JSON has colons
+                    auction_inventory = json.loads(auction_json)
+                except Exception as e:
+                    print(f"[Leader] Failed to parse auction inventory: {e}")
+            
+            self.register_worker(worker_id, worker_ip, worker_port, auction_inventory)
             return "OK"
         if msg_type == config.AUCTION_DONE_MESSAGE:
             if len(parts) < 3:
@@ -252,9 +290,17 @@ class LeaderService:
         
         return auctions
 
+    def trigger_auction_recovery(self):
+        """Unified recovery: spawn worker and reassign auctions from previous worker (now leader)."""
+        if not self.recover_from_worker_id:
+            return
+        
+        print(f"[Leader] Starting unified auction recovery for worker {self.recover_from_worker_id[:8]}")
+        self._reassign_auctions_with_recovery(self.recover_from_worker_id)
+
     def _reassign_auctions_with_recovery(self, dead_worker_id):
         """When a worker fails, spawn a fresh worker and recover auctions to it."""
-        print(f"[Leader] Attempting to recover auctions from dead worker {dead_worker_id}")
+        print(f"[Leader] Attempting to recover auctions from worker {dead_worker_id[:8]}")
         
         recovered_auctions = self._recover_worker_auctions(dead_worker_id)
         

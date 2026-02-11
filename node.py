@@ -359,7 +359,15 @@ class Node:
             self.is_leader = True
             print(">>> I AM THE LEADER NOW <<<")
             self.current_leader_ip = self.ip
-            self.leader_service = LeaderService(self.ip)
+            
+            # Check if this node was a worker with active auctions
+            recover_from = None
+            if self.worker_service and self.worker_service.auctions:
+                print(f"[Node] I was managing {len(self.worker_service.auctions)} auctions - will trigger recovery")
+                recover_from = self.node_id
+            
+            # Create leader service (with optional recovery)
+            self.leader_service = LeaderService(self.ip, recover_from_worker_id=recover_from)
             self.leader_service.start()
             
             # Announce leadership to the world

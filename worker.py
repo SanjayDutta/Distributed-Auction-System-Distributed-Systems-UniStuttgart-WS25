@@ -349,8 +349,29 @@ class WorkerService:
     def _register_with_leader(self):
         if not self.leader_ip or self.port is None:
             return
-        message = f"{config.WORKER_REGISTER_MESSAGE}:{self.worker_id}:{self.worker_ip}:{self.port}"
+        
+        # Include auction inventory when registering
+        auction_inventory = self._get_auction_inventory()
+        import json
+        auction_json = json.dumps(auction_inventory)
+        
+        message = f"{config.WORKER_REGISTER_MESSAGE}:{self.worker_id}:{self.worker_ip}:{self.port}:{auction_json}"
         self._send_control_message(message)
+
+    def _get_auction_inventory(self):
+        """Get list of active auctions for registration with leader."""
+        inventory = []
+        with self.lock:
+            for auction_id, auction in self.auctions.items():
+                inventory.append({
+                    "auction_id": auction_id,
+                    "item": auction.item,
+                    "starting_bid": auction.starting_bid,
+                    "highest_bid": auction.highest_bid,
+                    "highest_bidder": auction.highest_bidder,
+                    "status": auction.status,
+                })
+        return inventory
 
     def notify_auction_done(self, auction_id):
         message = f"{config.AUCTION_DONE_MESSAGE}:{self.worker_id}:{auction_id}"
