@@ -3,24 +3,24 @@ import random
 import time
 import threading
 import json
-import argparse
 import requests
 
 import config
 
 class Client:
-    def __init__(self, leader_ip=None):
-        # Parse command line arguments if leader_ip not provided
-        if leader_ip is None:
-            parser = argparse.ArgumentParser(description='Auction Client')
-            parser.add_argument('--leader', required=True, help='Leader machine IP address')
-            args = parser.parse_args()
-            leader_ip = args.leader
-        
-        self.leader_url = f"http://{leader_ip}:{config.LEADER_HTTP_PORT}"
-        
+    def __init__(self):
         randomNo = random.randint(10000000, 99999999) 
         self.client_id = str(randomNo)
+        
+        # Setup UDP socket for discovery
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_REUSEPORT'):
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.bind(('', config.BROADCAST_PORT))
+        
+        self.leader_url = None  # Will be set after discovery
         
         self.running = True
         self.auction_sock = None
@@ -34,20 +34,26 @@ class Client:
         self.recovery_retry_delay = 5
 
     def start(self):
-        print(f"[Client {self.client_id[:8]}] Connecting to leader at {self.leader_url}")
+        print(f"[Client {self.client_id[:8]}] Starting leader discovery...")
         
-        # Test connection to leader
+        # Discover leader
+        if not self.discover_leader():
+            print("\nFailed to discover leader. Make sure:")
+            print("  1. Node processes are running")
+            print("  2. Leader has been elected")
+            print("  3. Network connectivity is good")
+            return
+        
+        print(f"[Client {self.client_id[:8]}] Connected to leader at {self.leader_url}\n")
+        
+        # Test connection
         try:
             auctions = self.list_existing_auctions()
         except Exception as e:
-            print(f"\nFailed to connect to leader at {self.leader_url}: {e}")
-            print("Make sure:")
-            print("  1. Node processes are running on the leader machine")
-            print("  2. Leader has been elected")
-            print("  3. The IP address is correct")
+            print(f"\nFailed to connect to leader: {e}")
             return
-        
-        print("Connected to leader successfully!\n")
+
+        auction_input_map = {}
 
         while self.running:
             choice = input("\nOptions:\n  [1] List existing auctions\n  [2] Join auction\n  [3] Create a new auction\n> ")
@@ -59,9 +65,11 @@ class Client:
             if choice == "1":
                 print("List existing auctions")
                 auctions = self.list_existing_auctions()
+                auction_input_map = {}  # Reset when listing
             
             elif choice == "2":
                 if not auctions:
+                    print("No auctions listed. Please select [1] to list auctions first.")
                     continue
                 print("Join auction")
 
@@ -74,6 +82,7 @@ class Client:
                     print("\nNo auctions available")
                     continue
 
+                auction_input_map = {}  # Reset map
                 for i, key in enumerate(auctions.keys()):
                     auction_input_map[i] = {"auction_id": key, **auctions[key]}
                     print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
@@ -92,6 +101,59 @@ class Client:
             elif choice == "3":
                 print("Create new auction")
                 self.create_new_auction()
+
+    def discover_leader(self):
+        """Discover leader IP and port via broadcast."""
+        max_discovery_retries = 5
+        retry_count = 0
+        
+        while retry_count < max_discovery_retries:
+            print(f"[Client] Broadcasting WHO_IS_LEADER (attempt {retry_count + 1}/{max_discovery_retries})...")
+            self.sock.settimeout(5)
+            
+            try:
+                # Send WHO_IS_LEADER broadcast
+                self.sock.sendto(config.WHO_IS_LEADER_MESSAGE.encode(), ('<broadcast>', config.BROADCAST_PORT))
+                
+                # Wait for response
+                try:
+                    data, addr = self.sock.recvfrom(1024)
+                    message = data.decode('utf-8').strip()
+                    parts = message.split(":")
+                    
+                    # Filter out our own broadcast echo
+                    if message == config.WHO_IS_LEADER_MESSAGE:
+                        print("[Client] Received own broadcast echo, waiting for leader response...")
+                        retry_count += 1
+                        time.sleep(2)
+                        continue
+                    
+                    if parts[0] == config.LEADER_RESPONSE_MESSAGE and len(parts) >= 3:
+                        leader_ip = parts[1]
+                        leader_port = int(parts[2])
+                        self.leader_url = f"http://{leader_ip}:{leader_port}"
+                        print(f"[Client] Leader discovered at {leader_ip}:{leader_port}")
+                        return True
+                    else:
+                        print(f"[Client] Invalid response from leader: {message}")
+                        retry_count += 1
+                        time.sleep(2)
+                        continue
+                        
+                except socket.timeout:
+                    print("[Client] Discovery timeout - retrying...")
+                    retry_count += 1
+                    time.sleep(2)
+                    continue
+                    
+            except Exception as e:
+                print(f"[Client] Discovery error: {e}")
+                retry_count += 1
+                time.sleep(2)
+                continue
+        
+        print(f"[Client] Failed to discover leader after {max_discovery_retries} attempts")
+        return False
 
     def list_existing_auctions(self):
         try:

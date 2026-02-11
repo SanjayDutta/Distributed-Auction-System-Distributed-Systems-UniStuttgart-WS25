@@ -127,7 +127,6 @@ class Node:
                             phase = int(parts[4])
                             direction = parts[5]
                             self.handle_hs_reply(origin_uuid, phase, direction)
-
                 elif msg_type == config.ELECTION_RESTART_PREFIX:
                     if not self.restart_election:
                          print(f"[Listener] Received ELECTION_RESTART from {sender_ip}. Stopping everything.")
@@ -138,6 +137,12 @@ class Node:
                     if self.is_leader:
                         print(f"[Listener] Discovery request from {sender_ip}. Im leader, replying.")
                         response = f"{config.LEADER_FOUND_PREFIX}:{self.node_id}:{self.ip}"
+                        self.sock.sendto(response.encode(), ('<broadcast>', config.BROADCAST_PORT))
+                
+                elif msg_type == config.WHO_IS_LEADER_MESSAGE:
+                    if self.is_leader:
+                        print(f"[Listener] WHO_IS_LEADER request from {sender_ip}. I am leader, responding with IP.")
+                        response = f"{config.LEADER_RESPONSE_MESSAGE}:{self.ip}:{config.LEADER_HTTP_PORT}"
                         self.sock.sendto(response.encode(), ('<broadcast>', config.BROADCAST_PORT))
                 
                 elif msg_type == config.PEER_DISCOVERY_PREFIX:
