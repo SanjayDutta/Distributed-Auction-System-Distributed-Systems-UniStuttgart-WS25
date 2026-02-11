@@ -27,6 +27,12 @@ class Client:
         self.auction_running = False
 
         self.auction_sequence_number = 0
+        
+        # Recovery state
+        self.current_auction_id = None
+        self.recovery_retries = 0
+        self.max_recovery_retries = 10  # Increased to allow more time for leader recovery
+        self.recovery_retry_delay = 5  # seconds between retries (increased for spawn time)
 
     def start(self):
         listener_thread = threading.Thread(target=self.listen_for_broadcasts, daemon=True)
@@ -171,6 +177,10 @@ class Client:
         message = config.AUCTION_JOIN_MESSAGE + ":" + auction_id + ":" + self.client_id + "\n"
         
         print("try join auction", message)
+        
+        # Store current auction ID for recovery purposes
+        self.current_auction_id = auction_id
+        self.recovery_retries = 0
 
         try:
             auction_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -259,61 +269,153 @@ class Client:
 
 
     def listen_for_auction_messages(self):
+        """Listen for auction messages with automatic recovery on connection failure."""
         
         while self.auction_running:
             try:
                 data = self.auction_sock.recv(1024)
+                if not data:
+                    # Socket closed by server
+                    raise ConnectionResetError("Server closed connection")
+            except socket.timeout:
+                # Timeout is normal if no messages arrive; just continue waiting
+                continue
+            except (ConnectionResetError, BrokenPipeError, socket.error) as e:
+                print(f"\n[ERROR] Connection to worker lost: {e}")
+                self._attempt_recovery()
+                return  # Exit listener, main thread will handle recovery
             except Exception as e:
                 continue
-                #print("Failed to listen to auction messages:", e)
 
-            message = data.decode('utf-8').strip()
-            parts = message.split(":")
-            result = parts[0]
-            # print("GOT MESSAGE", message)
+            try:
+                message = data.decode('utf-8').strip()
+                parts = message.split(":")
+                result = parts[0]
 
-            #print(parts)
-            if result == config.AUCTION_BID_UPDATE_MESSAGE:
-                if len(parts) < 4:
-                    continue
+                if result == config.AUCTION_BID_UPDATE_MESSAGE:
+                    if len(parts) < 4:
+                        continue
 
-                self.highest_bid = parts[2]
-                highest_bidder = parts[3]
-                self.auction_sequence_number = int(parts[4])
+                    self.highest_bid = parts[2]
+                    highest_bidder = parts[3]
+                    self.auction_sequence_number = int(parts[4])
 
-                print(f"\n{highest_bidder} just made the highest bid {self.highest_bid}!")
+                    print(f"\n{highest_bidder} just made the highest bid {self.highest_bid}!")
+                    
+                elif result == "OK":
+                    if len(parts) < 3:
+                        continue
+                    self.highest_bid = parts[1]
+                    self.auction_sequence_number = int(parts[2])
+
+                    print("\nYour bid was accepted!")
+                    print("New highest bid:", self.highest_bid)
+
+                elif result == "REJECT":
+                    if parts[1] == "LOW_BID":
+                        print(f"\nYour bid was too low!")
+                    elif parts[1] == "MSG_OUT_OF_ORDER":
+                        print("Someone else sent a bid earlier!")
+
+                elif result == config.AUCTION_RESULT_MESSAGE:
+
+                    if len(parts) < 4:
+                        continue
+                    winner = parts[2]
+                    winning_bid = parts[3]
+                    if winner == self.client_id:
+                        winner += " (you)"
+
+                    print("\n**********\n\nAuction has finished!\n")
+                    print("Winner:", winner, "with the bid", winning_bid)
+                    self.auction_running = False
+            except Exception as e:
+                print(f"[ERROR] Failed to process message: {e}")
+                continue
+
+    def _attempt_recovery(self):
+        """Attempt to reconnect to a recovered auction worker."""
+        if self.recovery_retries >= self.max_recovery_retries:
+            print(f"\n[FATAL] Recovery failed after {self.max_recovery_retries} attempts. Giving up.")
+            self.auction_running = False
+            return
+        
+        self.recovery_retries += 1
+        print(f"\n[RECOVERY] Attempting to recover (attempt {self.recovery_retries}/{self.max_recovery_retries})...")
+        
+        # Wait before attempting recovery to give leader time to detect failure and reassign
+        print(f"[RECOVERY] Waiting {self.recovery_retry_delay} seconds before retry...")
+        time.sleep(self.recovery_retry_delay)
+        
+        # Query leader for current auction location
+        try:
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client_sock.settimeout(5)
+            
+            # Reuse JOIN_AUCTION_MESSAGE to get current worker location
+            message = f"{config.JOIN_AUCTION_MESSAGE}:{self.current_auction_id}"
+            client_sock.sendto(message.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
+            
+            data, addr = client_sock.recvfrom(1024)
+            response = data.decode('utf-8')
+            parts = response.split(":")
+            
+            if response.startswith("WORKER_INFO:"):
+                # Format: WORKER_INFO:auction_id:worker_ip:worker_port
+                auction_id = parts[1]
+                worker_ip = parts[2]
+                worker_port = int(parts[3])
                 
-            elif result == "OK":
-                if len(parts) < 3:
-                    continue
-                self.highest_bid = parts[1]
-                self.auction_sequence_number = int(parts[2])
+                print(f"[RECOVERY] Found auction on new worker: {worker_ip}:{worker_port}")
+                
+                # Close old connection
+                try:
+                    self.auction_sock.close()
+                except:
+                    pass
+                
+                # Reconnect to new worker
+                self._reconnect_to_worker(auction_id, worker_ip, worker_port)
+            else:
+                print(f"[RECOVERY] Unexpected response from leader: {response}")
+        except Exception as e:
+            print(f"[RECOVERY] Failed to query leader: {e}")
 
-                print("\nYour bid was accepted!")
-                print("New highest bid:", self.highest_bid)
-
-            elif result == "REJECT":
-                if parts[1] == "LOW_BID":
-                    print(f"\nYour bid was too low!")
-                elif parts[1] == "MSG_OUT_OF_ORDER":
-                    print("Someone else sent a bid earlier!")
-
-            elif result == config.AUCTION_RESULT_MESSAGE:
-
-                if len(parts) < 4:
-                    continue
-                winner = parts[2]
-                winning_bid = parts[3]
-                if winner == self.client_id:
-                    winner += " (you)"
-
-                print("\n**********\n\nAuction has finished!\n")
-                print("Winner:", winner, "with the bid", winning_bid)
+    def _reconnect_to_worker(self, auction_id, worker_ip, worker_port):
+        """Reconnect to a (potentially new) worker and rejoin the auction."""
+        try:
+            print(f"[RECOVERY] Connecting to worker at {worker_ip}:{worker_port}")
+            
+            auction_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            auction_sock.settimeout(5)
+            auction_sock.connect((worker_ip, worker_port))
+            
+            # Send join message
+            message = f"{config.AUCTION_JOIN_MESSAGE}:{auction_id}:{self.client_id}\n"
+            auction_sock.sendall(message.encode())
+            
+            data = auction_sock.recv(1024)
+            msg = data.decode('utf-8').strip()
+            parts = msg.split(":")
+            
+            if parts[0] == "OK":
+                self.auction_sequence_number = int(parts[1])
+                self.auction_sock = auction_sock
+                print("[RECOVERY] Successfully rejoined auction! Resuming...")
+                
+                # Restart listener
+                listener_thread = threading.Thread(target=self.listen_for_auction_messages, daemon=True)
+                listener_thread.start()
+            else:
+                print(f"[RECOVERY] Failed to rejoin auction: {msg}")
                 self.auction_running = False
-
-            # if result != "OK":
-                # print("Failed to join auction")
-                # return
+        except Exception as e:
+            print(f"[RECOVERY] Failed to reconnect: {e}")
+            if self.recovery_retries < self.max_recovery_retries:
+                print("[RECOVERY] Retrying...")
+                self._attempt_recovery()
+            else:
+                self.auction_running = False
 
 
 

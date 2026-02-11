@@ -17,7 +17,7 @@ class Node:
         self.node_id = str(randomNo)
         
 
-        self.ip = socket.gethostbyname(socket.gethostname())
+        self.ip = config.get_network_ip()
         self.peers = {} # Dictionary of UUID -> IP
         self.running = True
         self.running = True

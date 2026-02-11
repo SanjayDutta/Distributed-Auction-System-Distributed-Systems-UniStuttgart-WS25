@@ -1,5 +1,10 @@
+import csv
 import json
+import os
+import platform
 import socket
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -161,7 +166,7 @@ class LeaderService:
 
         return "ERROR:UNKNOWN_COMMAND"
 
-    def _allocate_worker(self, auction_id):
+    def _allocate_worker(self, auction_id, retry_spawn=True):
         with self.lock:
             candidates = []
             for worker_id, worker in self.worker_registry.items():
@@ -169,16 +174,201 @@ class LeaderService:
                 if active_count < config.WORKER_MAX_AUCTIONS:
                     candidates.append((active_count, worker_id, worker))
             if not candidates:
+                if retry_spawn:
+                    # Release lock before spawning to avoid blocking
+                    pass
+                else:
+                    return None
+            else:
+                candidates.sort()
+                _, worker_id, worker = candidates[0]
+                worker["active_auctions"].add(auction_id)
+                return {
+                    "id": worker_id,
+                    "ip": worker["ip"],
+                    "port": worker["port"],
+                }
+        
+        # If we reach here and retry_spawn is True, try spawning a new worker
+        if retry_spawn:
+            self._spawn_worker_node()
+            time.sleep(2)  # Wait for new worker to register
+            return self._allocate_worker(auction_id, retry_spawn=False)
+        
+        return None
+
+    def _spawn_worker_node(self):
+        """Spawn a new node.py process in a separate Terminal window (OS-specific)."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            node_script = os.path.join(script_dir, 'node.py')
+            
+            system = platform.system()
+            
+            if system == 'Darwin':  # macOS
+                cmd = f"cd '{script_dir}' && python node.py"
+                apple_script = f'tell application "Terminal" to do script "{cmd}"'
+                subprocess.Popen(['osascript', '-e', apple_script])
+                
+            elif system == 'Windows':
+                subprocess.Popen(f'start cmd /k "cd /d {script_dir} && python node.py"', shell=True)
+                
+            else:  # Linux and other Unix-like systems
+                # Try common terminal emulators in order of preference
+                terminal_cmds = [
+                    ['gnome-terminal', '--', 'bash', '-c', f'cd {script_dir} && python node.py; bash'],
+                    ['xterm', '-hold', '-e', f'bash -c "cd {script_dir} && python node.py"'],
+                    ['konsole', '--noclose', '-e', 'bash', '-c', f'cd {script_dir} && python node.py'],
+                ]
+                
+                for cmd in terminal_cmds:
+                    try:
+                        subprocess.Popen(cmd)
+                        break
+                    except FileNotFoundError:
+                        continue
+            
+            print("[Leader] Spawned new worker node in a separate Terminal")
+        except Exception as e:
+            print(f"[Leader] Failed to spawn worker node: {e}")
+
+    def _recover_worker_auctions(self, worker_id):
+        """Read auction data from worker's CSV file and return as list of dicts."""
+        csv_file = f"auctions_{worker_id}.csv"
+        auctions = []
+        
+        if not os.path.exists(csv_file):
+            return auctions
+        
+        try:
+            with open(csv_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row and row.get('auction_id'):
+                        auctions.append(row)
+            print(f"[Leader] Recovered {len(auctions)} auctions from worker {worker_id}")
+        except Exception as e:
+            print(f"[Leader] Failed to recover auctions from {csv_file}: {e}")
+        
+        return auctions
+
+    def _reassign_auctions_with_recovery(self, dead_worker_id):
+        """When a worker fails, spawn a fresh worker and recover auctions to it."""
+        print(f"[Leader] Attempting to recover auctions from dead worker {dead_worker_id}")
+        
+        recovered_auctions = self._recover_worker_auctions(dead_worker_id)
+        
+        if not recovered_auctions:
+            print(f"[Leader] No auctions to recover from worker {dead_worker_id}")
+            return
+        
+        # Always spawn a fresh worker for recovery (more reliable than checking existing workers)
+        print(f"[Leader] Spawning fresh worker for auction recovery...")
+        self._spawn_worker_node()
+        
+        # Wait for new worker to register (spawn + discovery + registration takes ~5-6 seconds)
+        print(f"[Leader] Waiting 6 seconds for new worker to register...")
+        time.sleep(6)
+        
+        # Try to recover each auction
+        for auction_data in recovered_auctions:
+            auction_id = auction_data.get('auction_id')
+            if not auction_id:
+                continue
+            
+            # Only reassign if not already handled
+            if auction_id not in self.auction_map:
+                # Find the most recently registered worker (the one we just spawned)
+                new_worker = self._get_newest_worker()
+                
+                if new_worker:
+                    # Send recovered auction data to new worker for restoration
+                    success = self._send_recovered_auction_to_worker(new_worker, auction_data)
+                    
+                    if success:
+                        with self.lock:
+                            self.auction_map[auction_id] = new_worker['id']
+                        print(f"[Leader] Reassigned auction {auction_id} to worker {new_worker['id'][:8]} at {new_worker['ip']}:{new_worker['port']}")
+                    else:
+                        print(f"[Leader] Failed to recover auction {auction_id} on new worker")
+                else:
+                    print(f"[Leader] No new worker available for recovery (spawn may have failed)")
+
+    def _get_newest_worker(self):
+        """Get the most recently registered worker (lowest active auction count)."""
+        with self.lock:
+            if not self.worker_registry:
                 return None
+            
+            # Find worker with fewest active auctions (newly spawned will have 0)
+            candidates = []
+            for worker_id, worker in self.worker_registry.items():
+                active_count = len(worker["active_auctions"])
+                candidates.append((active_count, worker_id, worker))
+            
+            if not candidates:
+                return None
+            
             candidates.sort()
             _, worker_id, worker = candidates[0]
-            worker["active_auctions"].add(auction_id)
+            
             return {
                 "id": worker_id,
                 "ip": worker["ip"],
                 "port": worker["port"],
             }
-        return None
+
+    def _send_recovered_auction_to_worker(self, worker, auction_data):
+        """Send recovered auction data to a worker so it can restore the auction."""
+        try:
+            # First, verify worker is alive with a heartbeat
+            try:
+                with socket.create_connection((worker["ip"], worker["port"]), timeout=2) as conn:
+                    conn.sendall((config.HEARTBEAT_MESSAGE + "\n").encode())
+                    with conn.makefile("r") as reader:
+                        response = reader.readline().strip()
+                        if response != "ALIVE":
+                            print(f"[Leader] Worker {worker['id']} not responding to heartbeat, skipping recovery")
+                            return False
+            except Exception as e:
+                print(f"[Leader] Worker {worker['id']} health check failed: {e}")
+                return False
+            
+            auction_id = auction_data.get('auction_id')
+            item = auction_data.get('item', '')
+            starting_bid = auction_data.get('starting_bid', '0')
+            highest_bid = auction_data.get('highest_bid', starting_bid)
+            highest_bidder = auction_data.get('highest_bidder', '')
+            status = auction_data.get('status', 'open')
+            end_time = auction_data.get('end_time', '')
+            
+            # Send AUCTION_RECOVER message to worker
+            # Format: AUCTION_RECOVER:auction_id:item:starting_bid:highest_bid:highest_bidder:status:end_time
+            message = ":".join([
+                "AUCTION_RECOVER",
+                auction_id,
+                item,
+                str(starting_bid),
+                str(highest_bid),
+                highest_bidder,
+                status,
+                str(end_time)
+            ])
+            
+            with socket.create_connection((worker["ip"], worker["port"]), timeout=2) as conn:
+                conn.sendall((message + "\n").encode())
+                with conn.makefile("r") as reader:
+                    response = reader.readline().strip()
+                    if response.startswith("OK"):
+                        print(f"[Leader] Successfully sent auction {auction_id} to worker {worker['id']}")
+                        return True
+                    else:
+                        print(f"[Leader] Worker {worker['id']} failed to recover auction: {response}")
+                        return False
+        except Exception as e:
+            print(f"[Leader] Failed to send recovered auction to worker: {e}")
+            return False
+
 
     def _release_worker(self, worker_id, auction_id):
         with self.lock:
@@ -266,7 +456,8 @@ class LeaderService:
             for id in list(self.worker_registry.keys()):
                 try:
                     ip = self.worker_registry[id]['ip']
-                    with socket.create_connection((ip, config.WORKER_TCP_PORT), timeout=2) as conn:
+                    port = self.worker_registry[id]['port']
+                    with socket.create_connection((ip, port), timeout=2) as conn:
                         conn.sendall((config.HEARTBEAT_MESSAGE + "\n").encode())
                         with conn.makefile("r") as reader:
                             result = reader.readline().strip()
@@ -281,6 +472,18 @@ class LeaderService:
 
                 if failed_heartbeats[id] >= 3:
                     print(f"3 heartbeats failed to worker {id}, re assigning auctions")
+                    
+                    # First, remove all auctions from auction_map for this dead worker
+                    # This prevents clients from getting stale worker info during recovery
+                    with self.lock:
+                        auctions_to_remove = [aid for aid, wid in self.auction_map.items() if wid == id]
+                        for auction_id in auctions_to_remove:
+                            del self.auction_map[auction_id]
+                            print(f"[Leader] Removed auction {auction_id} from map (worker {id} dead)")
+                    
+                    # Attempt to recover auctions from CSV
+                    self._reassign_auctions_with_recovery(id)
+                    
                     auctions = self.worker_registry[id]['active_auctions']
                     del self.worker_registry[id]
 

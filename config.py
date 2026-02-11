@@ -38,3 +38,33 @@ AUCTION_BID_MESSAGE = "AUCTION_BID"
 AUCTION_BID_UPDATE_MESSAGE = "AUCTION_BID_UPDATE"
 AUCTION_STATUS_MESSAGE = "AUCTION_STATUS"
 AUCTION_RESULT_MESSAGE = "AUCTION_RESULT"
+
+
+def get_network_ip():
+    """
+    Get the IP address of the machine on the local network.
+    Returns the IP that would be used to connect to an external address.
+    Falls back to hostname resolution if necessary.
+    """
+    import socket
+    try:
+        # Create a socket and try to connect to a remote address
+        # We don't actually connect, just use it to determine local IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # Google DNS
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        # Fallback: try hostname resolution
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            # Avoid returning localhost
+            if ip != "127.0.0.1":
+                return ip
+        except Exception:
+            pass
+    
+    # Last resort: return localhost (won't work across networks)
+    return "127.0.0.1"

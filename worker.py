@@ -1,3 +1,5 @@
+import csv
+import os
 import socket
 import threading
 import time
@@ -16,7 +18,7 @@ class WorkerService:
         self.leader_port = config.LEADER_TCP_PORT if leader_port is None else leader_port
 
         self.host = host
-        self.port = config.WORKER_TCP_PORT if port is None else port
+        self.port = 0 if port is None else port
         self.running = True
         self.started = False
         # auction_id -> Auction
@@ -25,12 +27,16 @@ class WorkerService:
         self.participant_conns = {}
         # Shared state is guarded because handlers run in threads.
         self.lock = threading.Lock()
+        
+        # CSV persistence file
+        self.csv_file = f"auctions_{worker_id}.csv"
+        self._init_csv_file()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
         self.sock.listen()
-        # self.port = self.sock.getsockname()[1]
+        self.port = self.sock.getsockname()[1]
 
     def start(self, leader_ip=None):
         """Start accepting TCP connections and optionally register with leader."""
@@ -118,6 +124,8 @@ class WorkerService:
             return self._handle_bid(parts, conn, joined_auctions)
         if msg_type == config.AUCTION_STATUS_MESSAGE:
             return self._handle_status(parts)
+        if msg_type == "AUCTION_RECOVER":
+            return self._handle_recover(parts)
         if msg_type == config.HEARTBEAT_MESSAGE:
             return "ALIVE"
         
@@ -146,6 +154,9 @@ class WorkerService:
                 self.participant_conns[auction_id][creator_id] = conn
                 joined_auctions[auction_id] = creator_id
             self._schedule_close(auction_id, auction.end_time)
+            
+            # Persist to CSV
+            self._persist_auction_to_csv(auction_id, auction)
 
         return f"OK:{auction_id}"
 
@@ -198,6 +209,8 @@ class WorkerService:
                 joined_auctions[auction_id] = client_id
                 response = f"OK:{auction.highest_bid}:{auction.auction_sequence_number}"
                 broadcast = (auction_id, auction.highest_bid, auction.highest_bidder, auction.auction_sequence_number)
+                # Persist bid update to CSV
+                self._persist_auction_to_csv(auction_id, auction)
             else:
                 response = f"REJECT:LOW_BID:{auction.auction_sequence_number}"
         # Broadcast highest bid update to participants.
@@ -220,6 +233,48 @@ class WorkerService:
             winner = auction.highest_bidder or ""
             return f"STATUS:{status}:{auction.highest_bid}:{winner}"
 
+    def _handle_recover(self, parts):
+        """Recover a previously lost auction from leader (after worker failure and recovery)."""
+        if len(parts) < 8:
+            return "ERROR:BAD_REQUEST"
+        
+        auction_id = parts[1]
+        item = parts[2]
+        starting_bid = parts[3]
+        highest_bid = parts[4]
+        highest_bidder = parts[5] if parts[5] else None
+        status = parts[6]
+        end_time_str = parts[7]
+        
+        try:
+            end_time = float(end_time_str) if end_time_str else None
+        except ValueError:
+            end_time = None
+        
+        with self.lock:
+            if auction_id in self.auctions:
+                return "ERROR:ALREADY_EXISTS"
+            
+            # Recreate auction from recovered data
+            auction = Auction(item, starting_bid, duration_seconds=None, auction_id=auction_id, start_time=None)
+            auction.highest_bid = float(highest_bid)
+            auction.highest_bidder = highest_bidder
+            auction.status = status
+            auction.end_time = end_time
+            
+            self.auctions[auction_id] = auction
+            self.participant_conns[auction_id] = {}
+            
+            # If auction is already closed, don't schedule a close timer
+            if status != "closed" and end_time:
+                self._schedule_close(auction_id, end_time)
+            
+            # Persist to CSV
+            self._persist_auction_to_csv(auction_id, auction)
+        
+        print(f"[Worker] Recovered auction {auction_id} (item: {item}, status: {status})")
+        return f"OK:{auction_id}"
+
     def _schedule_close(self, auction_id, end_time):
         """Start a timer thread to close the auction at its deadline."""
         if end_time is None:
@@ -241,6 +296,8 @@ class WorkerService:
             if auction is None or auction.status != "open":
                 return
             auction.close()
+            # Persist closed status to CSV
+            self._persist_auction_to_csv(auction_id, auction)
 
         # Notify participants outside the lock to avoid blocking new bids/joins.
         self._notify_result(auction_id, auction)
@@ -316,10 +373,70 @@ class WorkerService:
         except OSError:
             return
 
+    def _init_csv_file(self):
+        """Initialize CSV file with headers if it doesn't exist."""
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['auction_id', 'item', 'starting_bid', 'highest_bid', 'highest_bidder', 'status', 'participants', 'end_time'])
+
+    def _persist_auction_to_csv(self, auction_id, auction):
+        """Write or update auction data to CSV file."""
+        try:
+            # Read all rows
+            rows = []
+            if os.path.exists(self.csv_file):
+                with open(self.csv_file, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    rows = list(reader)
+            
+            # Find and update or append
+            header = rows[0] if rows else ['auction_id', 'item', 'starting_bid', 'highest_bid', 'highest_bidder', 'status', 'participants', 'end_time']
+            data_rows = rows[1:] if len(rows) > 1 else []
+            
+            # Check if auction exists in CSV
+            auction_found = False
+            for i, row in enumerate(data_rows):
+                if row and row[0] == auction_id:
+                    # Update existing row
+                    data_rows[i] = [
+                        auction_id,
+                        auction.item,
+                        str(auction.starting_bid),
+                        str(auction.highest_bid),
+                        auction.highest_bidder or '',
+                        auction.status,
+                        ','.join(auction.participants),
+                        str(auction.end_time) if auction.end_time else ''
+                    ]
+                    auction_found = True
+                    break
+            
+            if not auction_found:
+                # Add new row
+                data_rows.append([
+                    auction_id,
+                    auction.item,
+                    str(auction.starting_bid),
+                    str(auction.highest_bid),
+                    auction.highest_bidder or '',
+                    auction.status,
+                    ','.join(auction.participants),
+                    str(auction.end_time) if auction.end_time else ''
+                ])
+            
+            # Write back to file
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(data_rows)
+        except Exception as e:
+            print(f"[Worker] Failed to persist auction to CSV: {e}")
+
 
 if __name__ == "__main__":
     worker_id = str(uuid.uuid4())
-    worker_ip = socket.gethostbyname(socket.gethostname())
+    worker_ip = config.get_network_ip()
     server = WorkerService(worker_id, worker_ip)
     print(f"[Worker] TCP server listening on {server.host}:{server.port}")
     server.start()

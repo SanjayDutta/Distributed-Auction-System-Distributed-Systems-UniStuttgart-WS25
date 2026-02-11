@@ -1,0 +1,2 @@
+auction_id,item,starting_bid,highest_bid,highest_bidder,status,participants,end_time
+91c660d5-26e3-457b-90af-5a260d064b53,bike,300.0,310.0,11264612,closed,11264612,1770792980.128057
