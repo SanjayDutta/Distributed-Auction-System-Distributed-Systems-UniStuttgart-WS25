@@ -8,8 +8,92 @@ import sys
 import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
 import config
+
+
+class LeaderHTTPHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for client-leader communication."""
+    leader_service = None  # Set by LeaderService
+    
+    def log_message(self, format, *args):
+        """Suppress default HTTP logging."""
+        pass
+    
+    def do_GET(self):
+        """Handle GET requests."""
+        parsed_path = urlparse(self.path)
+        
+        if parsed_path.path == '/auctions':
+            # List all auctions
+            try:
+                auctions = self.leader_service.list_auctions_with_status()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(auctions).encode())
+            except Exception as e:
+                self.send_error(500, f"Internal error: {e}")
+        
+        elif parsed_path.path.startswith('/auctions/'):
+            # Get worker info for specific auction
+            auction_id = parsed_path.path.split('/')[-1]
+            try:
+                worker_info = self.leader_service.get_worker_for_auction(auction_id)
+                if worker_info:
+                    result = {
+                        "worker_ip": worker_info["ip"],
+                        "worker_port": worker_info["port"]
+                    }
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(result).encode())
+                else:
+                    self.send_error(404, "Auction not found")
+            except Exception as e:
+                self.send_error(500, f"Internal error: {e}")
+        else:
+            self.send_error(404, "Not found")
+    
+    def do_POST(self):
+        """Handle POST requests."""
+        parsed_path = urlparse(self.path)
+        
+        if parsed_path.path == '/auctions':
+            # Create new auction
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                data = json.loads(post_data.decode())
+                
+                item = data.get('item')
+                starting_bid = data.get('starting_bid')
+                
+                if not item or not starting_bid:
+                    self.send_error(400, "Missing item or starting_bid")
+                    return
+                
+                result = self.leader_service.create_auction(item, starting_bid)
+                if result:
+                    auction_id, worker_ip, worker_port = result
+                    response = {
+                        "auction_id": auction_id,
+                        "worker_ip": worker_ip,
+                        "worker_port": worker_port
+                    }
+                    self.send_response(201)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_error(503, "No workers available")
+            except Exception as e:
+                self.send_error(500, f"Internal error: {e}")
+        else:
+            self.send_error(404, "Not found")
 
 
 class LeaderService:
@@ -34,15 +118,29 @@ class LeaderService:
         self.sock.listen()
         self.port = self.sock.getsockname()[1]
 
+        # HTTP server for client communication
+        self.http_server = None
+        self.http_thread = None
+
         self.heartbeat_worker_thread = threading.Thread(target=self.heartbeat_worker_server, daemon=True)
         self.heartbeat_worker_thread.start()
 
     def start(self):
-        """Start the TCP control server for worker registration."""
+        """Start the TCP control server for worker registration and HTTP server for clients."""
         print(f"[Leader] LeaderService starting on {self.host}:{self.port}")
         self.running = True
         accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         accept_thread.start()
+        
+        # Start HTTP server for client communication
+        try:
+            self.http_server = HTTPServer((self.host, config.LEADER_HTTP_PORT), LeaderHTTPHandler)
+            LeaderHTTPHandler.leader_service = self
+            self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+            self.http_thread.start()
+            print(f"[Leader] HTTP server started on {self.host}:{config.LEADER_HTTP_PORT}")
+        except Exception as e:
+            print(f"[Leader] Failed to start HTTP server: {e}")
         
         # If we have auctions to recover (worker became leader), trigger recovery
         if self.recover_from_worker_id:
@@ -53,12 +151,20 @@ class LeaderService:
         return accept_thread
 
     def stop(self):
-        """Stop the TCP control server."""
+        """Stop the TCP control server and HTTP server."""
         self.running = False
         try:
             self.sock.close()
         except OSError:
             pass
+        
+        # Stop HTTP server
+        if self.http_server:
+            try:
+                self.http_server.shutdown()
+                print("[Leader] HTTP server stopped")
+            except Exception as e:
+                print(f"[Leader] Error stopping HTTP server: {e}")
 
     def register_worker(self, worker_id, worker_ip, worker_port, auction_inventory=None):
         with self.lock:

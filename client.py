@@ -3,54 +3,51 @@ import random
 import time
 import threading
 import json
+import argparse
+import requests
 
 import config
 
 class Client:
-    def __init__(self):
+    def __init__(self, leader_ip=None):
+        # Parse command line arguments if leader_ip not provided
+        if leader_ip is None:
+            parser = argparse.ArgumentParser(description='Auction Client')
+            parser.add_argument('--leader', required=True, help='Leader machine IP address')
+            args = parser.parse_args()
+            leader_ip = args.leader
+        
+        self.leader_url = f"http://{leader_ip}:{config.LEADER_HTTP_PORT}"
+        
         randomNo = random.randint(10000000, 99999999) 
         self.client_id = str(randomNo)
-        self.global_leader_ip = None
         
-        # Setup UDP socket for listening (The "Ear")
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, 'SO_REUSEPORT'):
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.bind(('', config.BROADCAST_PORT))
-
         self.running = True
-
         self.auction_sock = None
-
         self.auction_running = False
-
         self.auction_sequence_number = 0
         
         # Recovery state
         self.current_auction_id = None
         self.recovery_retries = 0
-        self.max_recovery_retries = 10  # Increased to allow more time for leader recovery
-        self.recovery_retry_delay = 5  # seconds between retries (increased for spawn time)
+        self.max_recovery_retries = 10
+        self.recovery_retry_delay = 5
 
     def start(self):
-        listener_thread = threading.Thread(target=self.listen_for_broadcasts, daemon=True)
-        listener_thread.start()
-        # print(self.node_id)
-        print(f"[Client {self.client_id[:8]}] Listener started on port {config.BROADCAST_PORT}")
-        # time.sleep(1)
-
-        self.sock.sendto(config.DISCOVERY_MESSAGE.encode(), ('<broadcast>', config.BROADCAST_PORT))
+        print(f"[Client {self.client_id[:8]}] Connecting to leader at {self.leader_url}")
         
-        print("Sent discovery, waiting until we find the leader")
-
-        while not self.global_leader_ip:
-            time.sleep(1)
+        # Test connection to leader
+        try:
+            auctions = self.list_existing_auctions()
+        except Exception as e:
+            print(f"\nFailed to connect to leader at {self.leader_url}: {e}")
+            print("Make sure:")
+            print("  1. Node processes are running on the leader machine")
+            print("  2. Leader has been elected")
+            print("  3. The IP address is correct")
+            return
         
-        auctions = self.list_existing_auctions()
-        
-        auction_input_map = {}
+        print("Connected to leader successfully!\n")
 
         while self.running:
             choice = input("\nOptions:\n  [1] List existing auctions\n  [2] Join auction\n  [3] Create a new auction\n> ")
@@ -97,80 +94,58 @@ class Client:
                 self.create_new_auction()
 
     def list_existing_auctions(self):
-        
-        client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client_sock.settimeout(5)
-        client_sock.sendto(config.GET_AUCTIONS_MESSAGE.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
-        print("wait for result")
         try:
-            data, addr = client_sock.recvfrom(1024)
+            response = requests.get(f"{self.leader_url}/auctions", timeout=5)
+            response.raise_for_status()
+            auctions = response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to get auctions from leader: {e}")
+            return {}
         except Exception as e:
-            print("Failed to get auctions from global leader:", e)
-            return
+            print(f"Error processing auction list: {e}")
+            return {}
         
-        message = data.decode()
-        parts = message.split(":", 1)
-        result = parts[0]
-
-        if result != "AUCTION_LIST":
-            print("Failed to get the auction list, response was:", message)
-
-        if len(parts) >= 2:
-            auctions = json.loads(parts[1])
-
         auction_input_map = {}
 
-        if auctions is None or not len(auctions.keys()):
+        if not auctions:
             print("\nNo auctions available")
         else:
             for i, key in enumerate(auctions.keys()):
                 auction_input_map[i] = {"auction_id": key, **auctions[key]}
-                print(f"  [{i}]", auction_input_map[i]['item'], auction_input_map[i]['highest_bid'])
+                print(f"  [{i}] {auction_input_map[i]['item']} - Highest bid: {auction_input_map[i]['highest_bid']}")
             
         return auctions
 
     def create_new_auction(self):
-        
         item = input("Item to sell: ")
         price = input("Starting bid: ")
 
         while not price.isdigit():
             price = input("Enter a real number for starting bid: ")
 
-        message = ":".join([
-            config.CREATE_AUCTION_MESSAGE,
-            item,
-            price
-        ])
-
-        client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client_sock.settimeout(5)
-        client_sock.sendto(message.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
-
         try:
-            data, addr = client_sock.recvfrom(1024)
+            response = requests.post(
+                f"{self.leader_url}/auctions",
+                json={"item": item, "starting_bid": price},
+                timeout=5
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            if "auction_id" in result:
+                print("Auction created successfully")
+                self.highest_bid = price
+                self.join_auction(
+                    result["auction_id"],
+                    result["worker_ip"],
+                    result["worker_port"]
+                )
+            else:
+                print("Failed to create auction:", result)
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to create auction: {e}")
         except Exception as e:
-            print("Failed to get auctions from global leader:", e)
-            return
-        
-        message = data.decode('utf-8')
-    
-        parts = message.split(":")
-        result = parts[0]
-        
-        # SUCCESS:978594d9-2eac-4161-98a7-32eae24d0a8a:192.168.0.80:58902
-        if result == "SUCCESS":
-            print("Auction created successfully")
-            auction_id = parts[1]
-            server_ip = parts[2]
-            server_port = int(parts[3])
-
-            # print(parts)
-            self.highest_bid = price
-            self.join_auction(auction_id, server_ip, server_port)
-
-        else:
-            print("Failed to create auction, message from global leader was:", message)
+            print(f"Error creating auction: {e}")
 
     def join_auction(self, auction_id, server_ip, server_port):
 
@@ -347,26 +322,20 @@ class Client:
         print(f"[RECOVERY] Waiting {self.recovery_retry_delay} seconds before retry...")
         time.sleep(self.recovery_retry_delay)
         
-        # Query leader for current auction location
+        # Query leader via HTTP for current auction location
         try:
-            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            client_sock.settimeout(5)
+            response = requests.get(
+                f"{self.leader_url}/auctions/{self.current_auction_id}",
+                timeout=5
+            )
+            response.raise_for_status()
+            result = response.json()
             
-            # Reuse JOIN_AUCTION_MESSAGE to get current worker location
-            message = f"{config.JOIN_AUCTION_MESSAGE}:{self.current_auction_id}"
-            client_sock.sendto(message.encode(), (self.global_leader_ip, config.BROADCAST_PORT))
-            
-            data, addr = client_sock.recvfrom(1024)
-            response = data.decode('utf-8')
-            parts = response.split(":")
-            
-            if response.startswith("WORKER_INFO:"):
-                # Format: WORKER_INFO:auction_id:worker_ip:worker_port
-                auction_id = parts[1]
-                worker_ip = parts[2]
-                worker_port = int(parts[3])
+            if "worker_ip" in result:
+                worker_ip = result["worker_ip"]
+                worker_port = result["worker_port"]
                 
-                print(f"[RECOVERY] Found auction on new worker: {worker_ip}:{worker_port}")
+                print(f"[RECOVERY] Found auction on worker: {worker_ip}:{worker_port}")
                 
                 # Close old connection
                 try:
@@ -375,11 +344,13 @@ class Client:
                     pass
                 
                 # Reconnect to new worker
-                self._reconnect_to_worker(auction_id, worker_ip, worker_port)
+                self._reconnect_to_worker(self.current_auction_id, worker_ip, worker_port)
             else:
-                print(f"[RECOVERY] Unexpected response from leader: {response}")
-        except Exception as e:
+                print(f"[RECOVERY] Auction not found on leader")
+        except requests.exceptions.RequestException as e:
             print(f"[RECOVERY] Failed to query leader: {e}")
+        except Exception as e:
+            print(f"[RECOVERY] Error during recovery: {e}")
 
     def _reconnect_to_worker(self, auction_id, worker_ip, worker_port):
         """Reconnect to a (potentially new) worker and rejoin the auction."""
@@ -416,33 +387,6 @@ class Client:
                 self._attempt_recovery()
             else:
                 self.auction_running = False
-
-
-
-    def listen_for_broadcasts(self):
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(1024)
-            except Exception as e:
-                print("Failed to discover global leader:", e)
-                return
-
-            message = data.decode('utf-8')
-            print("Received message:", message)
-            
-            if message == config.DISCOVERY_MESSAGE:
-                continue
-
-            parts = message.split(":")
-            msg_type = parts[0]
-            
-            if msg_type == config.LEADER_FOUND_PREFIX:
-                # Format: LEADER_FOUND:LEADER_UUID:LEADER_IP
-                if len(parts) >= 3:
-                    leader_uuid = parts[1]
-                    leader_ip = parts[2]
-                    print(f"\nLeader is {leader_ip} (UUID: {leader_uuid[:8]})")
-                    self.global_leader_ip = leader_ip
 
 
 if __name__ == "__main__":

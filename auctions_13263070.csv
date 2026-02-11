@@ -1,4 +1,0 @@
-auction_id,item,starting_bid,highest_bid,highest_bidder,status,participants,end_time
-a6afb6b6-431c-461f-bbc7-adba16b37b89,bike,200.0,1000.0,88033844,closed,,1770803492.53424
-0f600640-8bab-4920-a4c7-be837b0ad00f,tesla,1000.0,1200.0,88033844,closed,,1770803653.114611
-f2c4d542-58fb-4304-82ab-f463dbbbdca9,car,600.0,1000100000.0,88033844,closed,"88033844,68673963",1770803756.459998
