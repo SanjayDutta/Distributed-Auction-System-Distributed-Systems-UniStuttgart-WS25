@@ -298,7 +298,8 @@ class WorkerService:
             auction.close()
             # Persist closed status to CSV
             self._persist_auction_to_csv(auction_id, auction)
-
+        
+        print(f"[Worker {self.worker_id[:8]}] Auction {auction_id[:8]} closed, notifying participants and leader")
         # Notify participants outside the lock to avoid blocking new bids/joins.
         self._notify_result(auction_id, auction)
         self.notify_auction_done(auction_id)
@@ -352,6 +353,9 @@ class WorkerService:
         
         # Include auction inventory when registering
         auction_inventory = self._get_auction_inventory()
+        print(f"[Worker {self.worker_id[:8]}] Registering with leader, inventory: {len(auction_inventory)} auctions")
+        for auction in auction_inventory:
+            print(f"  - {auction['auction_id'][:8]}: {auction['item']} (status: {auction['status']})")
         import json
         auction_json = json.dumps(auction_inventory)
         
@@ -363,18 +367,21 @@ class WorkerService:
         inventory = []
         with self.lock:
             for auction_id, auction in self.auctions.items():
-                inventory.append({
-                    "auction_id": auction_id,
-                    "item": auction.item,
-                    "starting_bid": auction.starting_bid,
-                    "highest_bid": auction.highest_bid,
-                    "highest_bidder": auction.highest_bidder,
-                    "status": auction.status,
-                })
+                # Only report open auctions to leader, skip closed ones
+                if auction.status == "open":
+                    inventory.append({
+                        "auction_id": auction_id,
+                        "item": auction.item,
+                        "starting_bid": auction.starting_bid,
+                        "highest_bid": auction.highest_bid,
+                        "highest_bidder": auction.highest_bidder,
+                        "status": auction.status,
+                    })
         return inventory
 
     def notify_auction_done(self, auction_id):
         message = f"{config.AUCTION_DONE_MESSAGE}:{self.worker_id}:{auction_id}"
+        print(f"[Worker {self.worker_id[:8]}] Sending AUCTION_DONE for {auction_id[:8]} to leader at {self.leader_ip}:{self.leader_port}")
         self._send_control_message(message)
 
     def notify_bid_update(self, auction_id, highest_bid, highest_bidder, auction_sequence_number):
@@ -390,8 +397,10 @@ class WorkerService:
             with socket.create_connection((self.leader_ip, self.leader_port), timeout=2) as conn:
                 conn.sendall((message + "\n").encode())
                 with conn.makefile("r") as reader:
-                    reader.readline()
-        except OSError:
+                    response = reader.readline().strip()
+                    print(f"[Worker {self.worker_id[:8]}] Control message sent successfully: {message.split(':')[0]}, response: {response}")
+        except OSError as e:
+            print(f"[Worker {self.worker_id[:8]}] Failed to send control message '{message.split(':')[0]}': {e}")
             return
 
     def _init_csv_file(self):

@@ -41,11 +41,12 @@ class LeaderHTTPHandler(BaseHTTPRequestHandler):
             # Get worker info for specific auction
             auction_id = parsed_path.path.split('/')[-1]
             try:
-                worker_info = self.leader_service.get_worker_for_auction(auction_id)
-                if worker_info:
+                worker_addr = self.leader_service.get_worker_for_auction(auction_id)
+                if worker_addr:
+                    worker_ip, worker_port = worker_addr  # Unpack tuple
                     result = {
-                        "worker_ip": worker_info["ip"],
-                        "worker_port": worker_info["port"]
+                        "worker_ip": worker_ip,
+                        "worker_port": worker_port
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -179,6 +180,7 @@ class LeaderService:
                 print(f"[Leader] Rebuilding auction state from worker {worker_id[:8]} - {len(auction_inventory)} auctions")
                 for auction_data in auction_inventory:
                     auction_id = auction_data.get("auction_id")
+                    status = auction_data.get("status", "unknown")
                     if auction_id:
                         # Add to auction_map
                         self.auction_map[auction_id] = worker_id
@@ -190,15 +192,18 @@ class LeaderService:
                             "highest_bid": auction_data.get("highest_bid"),
                             "highest_bidder": auction_data.get("highest_bidder"),
                         }
-                        print(f"[Leader] Restored auction {auction_id[:8]} on worker {worker_id[:8]}")
+                        print(f"[Leader] Restored auction {auction_id[:8]} (item: {auction_data.get('item')}, status: {status}) on worker {worker_id[:8]}")
 
     def mark_auction_done(self, worker_id, auction_id):
         with self.lock:
             worker = self.worker_registry.get(worker_id)
             if worker:
                 worker["active_auctions"].discard(auction_id)
+            was_in_map = auction_id in self.auction_map
+            was_in_status = auction_id in self.auction_status
             self.auction_map.pop(auction_id, None)
             self.auction_status.pop(auction_id, None)
+            print(f"[Leader] Marked auction {auction_id[:8]} as done (was_in_map={was_in_map}, was_in_status={was_in_status})")
 
     def list_auctions(self):
         with self.lock:
@@ -291,6 +296,7 @@ class LeaderService:
                 return "ERROR:BAD_REQUEST"
             worker_id = parts[1]
             auction_id = parts[2]
+            print(f"[Leader] Received AUCTION_DONE from worker {worker_id[:8]} for auction {auction_id[:8]}")
             self.mark_auction_done(worker_id, auction_id)
             return "OK"
         if msg_type == config.AUCTION_BID_UPDATE_MESSAGE:
@@ -300,10 +306,17 @@ class LeaderService:
             highest_bid = parts[3]
             highest_bidder = parts[4]
             with self.lock:
-                self.auction_status[auction_id] = {
-                    "highest_bid": highest_bid,
-                    "highest_bidder": highest_bidder,
-                }
+                # Preserve existing auction_status fields (like item) when updating bid info
+                if auction_id in self.auction_status:
+                    self.auction_status[auction_id].update({
+                        "highest_bid": highest_bid,
+                        "highest_bidder": highest_bidder,
+                    })
+                else:
+                    self.auction_status[auction_id] = {
+                        "highest_bid": highest_bid,
+                        "highest_bidder": highest_bidder,
+                    }
             return "OK"
         if msg_type == config.HEARTBEAT_MESSAGE:
             return "ALIVE"
@@ -377,7 +390,7 @@ class LeaderService:
             print(f"[Leader] Failed to spawn worker node: {e}")
 
     def _recover_worker_auctions(self, worker_id):
-        """Read auction data from worker's CSV file and return as list of dicts."""
+        """Read auction data from worker's CSV file and return as list of dicts (only open auctions)."""
         csv_file = f"auctions_{worker_id}.csv"
         auctions = []
         
@@ -389,8 +402,13 @@ class LeaderService:
                 reader = csv.DictReader(f)
                 for row in reader:
                     if row and row.get('auction_id'):
-                        auctions.append(row)
-            print(f"[Leader] Recovered {len(auctions)} auctions from worker {worker_id}")
+                        # Only recover open auctions, skip closed ones
+                        if row.get('status') == 'open':
+                            auctions.append(row)
+                            print(f"[Leader] Recovering open auction {row.get('auction_id')[:8]} from worker {worker_id[:8]}")
+                        else:
+                            print(f"[Leader] Skipping closed auction {row.get('auction_id')[:8]} from worker {worker_id[:8]}")
+            print(f"[Leader] Recovered {len(auctions)} open auctions from worker {worker_id[:8]}")
         except Exception as e:
             print(f"[Leader] Failed to recover auctions from {csv_file}: {e}")
         
@@ -414,6 +432,18 @@ class LeaderService:
             print(f"[Leader] No auctions to recover from worker {dead_worker_id}")
             return
         
+        # Pre-populate auction_status so clients see auction info immediately
+        with self.lock:
+            for auction_data in recovered_auctions:
+                auction_id = auction_data.get('auction_id')
+                if auction_id and auction_id not in self.auction_map:
+                    self.auction_status[auction_id] = {
+                        "item": auction_data.get("item"),
+                        "highest_bid": auction_data.get("highest_bid"),
+                        "highest_bidder": auction_data.get("highest_bidder"),
+                    }
+                    print(f"[Leader] Pre-populated auction_status for {auction_id[:8]} (item: {auction_data.get('item')})")
+        
         # Always spawn a fresh worker for recovery (more reliable than checking existing workers)
         print(f"[Leader] Spawning fresh worker for auction recovery...")
         self._spawn_worker_node()
@@ -428,23 +458,24 @@ class LeaderService:
             if not auction_id:
                 continue
             
-            # Only reassign if not already handled
-            if auction_id not in self.auction_map:
-                # Find the most recently registered worker (the one we just spawned)
-                new_worker = self._get_newest_worker()
+            # Find the most recently registered worker (the one we just spawned)
+            new_worker = self._get_newest_worker()
+            
+            if new_worker:
+                # Send recovered auction data to new worker for restoration
+                success = self._send_recovered_auction_to_worker(new_worker, auction_data)
                 
-                if new_worker:
-                    # Send recovered auction data to new worker for restoration
-                    success = self._send_recovered_auction_to_worker(new_worker, auction_data)
-                    
-                    if success:
-                        with self.lock:
-                            self.auction_map[auction_id] = new_worker['id']
-                        print(f"[Leader] Reassigned auction {auction_id} to worker {new_worker['id'][:8]} at {new_worker['ip']}:{new_worker['port']}")
-                    else:
-                        print(f"[Leader] Failed to recover auction {auction_id} on new worker")
+                if success:
+                    with self.lock:
+                        # Update auction_map to point from dead worker to new worker
+                        # (auction was already in map, we're just updating the pointer)
+                        self.auction_map[auction_id] = new_worker['id']
+                        # auction_status already pre-populated above
+                    print(f"[Leader] Reassigned auction {auction_id[:8]} to worker {new_worker['id'][:8]} at {new_worker['ip']}:{new_worker['port']}")
                 else:
-                    print(f"[Leader] No new worker available for recovery (spawn may have failed)")
+                    print(f"[Leader] Failed to recover auction {auction_id[:8]} on new worker")
+            else:
+                print(f"[Leader] No new worker available for recovery (spawn may have failed)")
 
     def _get_newest_worker(self):
         """Get the most recently registered worker (lowest active auction count)."""
@@ -625,13 +656,9 @@ class LeaderService:
                 if failed_heartbeats[id] >= 3:
                     print(f"3 heartbeats failed to worker {id}, re assigning auctions")
                     
-                    # First, remove all auctions from auction_map for this dead worker
-                    # This prevents clients from getting stale worker info during recovery
-                    with self.lock:
-                        auctions_to_remove = [aid for aid, wid in self.auction_map.items() if wid == id]
-                        for auction_id in auctions_to_remove:
-                            del self.auction_map[auction_id]
-                            print(f"[Leader] Removed auction {auction_id} from map (worker {id} dead)")
+                    # Keep auctions in auction_map to avoid 404s during recovery
+                    # They still point to dead worker, but will be updated when new worker registers
+                    print(f"[Leader] Keeping {len([aid for aid, wid in self.auction_map.items() if wid == id])} auctions in map during recovery")
                     
                     # Attempt to recover auctions from CSV
                     self._reassign_auctions_with_recovery(id)

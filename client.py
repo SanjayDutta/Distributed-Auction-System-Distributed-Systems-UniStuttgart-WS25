@@ -270,7 +270,7 @@ class Client:
 
             print("sending...")
             try:
-                auction_sock.sendall(message.encode())
+                self.auction_sock.sendall(message.encode())
             except Exception as e:
                 print("Failed to send message:", e)
                 return
