@@ -15,10 +15,6 @@ This project implements a distributed auction system that allows multiple client
    git clone <repository-url>
    cd prod-area-ds-auction-w25
    ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
 
 ## Usage
 1. Start the one or multiple node:
