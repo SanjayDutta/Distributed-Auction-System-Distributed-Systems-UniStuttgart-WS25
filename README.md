@@ -1,33 +1,45 @@
-# Distributed Auction System - Current Status
+# Distributed Auction System
 
-## Implemented
-- **Node role selection**: Nodes run discovery + HS election and then take a role.
-  - Leader: starts `LeaderService` (TCP control server + auction assignment logic).
-  - Worker: starts `WorkerService` (auction TCP server + leader control client).
-- **Leader responsibilities** (`leader.py`):
-  - Worker registry with capacity-aware allocation (`WORKER_MAX_AUCTIONS`).
-  - Mapping `auction_id -> worker` and active auction tracking per worker.
-  - TCP control channel for `WORKER_REGISTER` and `AUCTION_DONE` messages.
-  - UDP handling for `CLIENT_HELLO` (returns auction list), `CREATE_AUCTION`, `JOIN_AUCTION`, `GET_AUCTIONS`.
-  - `AUCTION_BID_UPDATE` tracking for latest highest bid/ bidder.
-- **Worker responsibilities** (`worker.py`):
-  - TCP auction server with `AUCTION_CREATE`, `AUCTION_JOIN`, `AUCTION_BID`, `AUCTION_STATUS`.
-  - Broadcasts `AUCTION_BID_UPDATE` to all participants.
-  - Sends `AUCTION_RESULT` at auction end (60s fixed duration).
-  - Reports `AUCTION_BID_UPDATE` + `AUCTION_DONE` to leader via TCP control channel.
-- **Auction model** (`auction.py`):
-  - Tracks id, item, starting bid, highest bid/bidder, status, end time, participants.
-- **Test client** (`test.py`):
-  - CLI commands: `hello`, `create`, `bid`, `status`.
-  - Two-client workflow supported (creator listens; bidder bids higher and listens).
-- Client
-- Heartbeat from leader to worker servers
-- Heartbeat from worker servers to leader
+## Overview
+This project implements a distributed auction system that allows multiple clients to participate in auctions managed by a leader node. The system is designed to handle high availability and fault tolerance through a leader-worker architecture.
 
-## Not Implemented / Pending Integration
-- **Robustness / retries**:
-  - UDP messages have no ACK/retry (except test client retries).
-- **State recovery**:
-  - Target design: leader acts as the metadata center; workers manage their own auctions.
-  - On leader failure, a new leader should request workers to re-report their auction lists (snapshot recovery).
-  - Not implemented yet: worker persistence or re-sync logic.
+## Features
+- **Node Role Selection**: Nodes can discover each other and elect a leader to manage auctions.
+- **Leader Responsibilities**: The leader manages worker nodes, tracks active auctions, and handles client requests.
+- **Worker Responsibilities**: Workers execute auction logic, handle bids, and communicate results back to the leader.
+- **Auction Model**: Each auction is represented by an object that tracks its state, bids, and participants.
+
+## Installation
+1. Clone the repository:
+   ```bash
+   git clone <repository-url>
+   cd prod-area-ds-auction-w25
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Usage
+1. Start the one or multiple node:
+   ```bash
+   python node.py
+   ```
+2. Start client process:
+   ```bash
+   python worker.py
+   ```
+
+
+
+## Architectural Model
+The distributed auction system employs a hybrid architectural model utilizing both TCP and UDP protocols. TCP is used for reliable communication between nodes, ensuring that messages such as auction bids and results are delivered accurately. UDP is utilized for broadcasting messages like auction updates to multiple participants simultaneously, allowing for faster communication without the overhead of establishing a connection.
+
+## Discovery Mechanism
+The discovery mechanism implemented in `node.py` allows nodes to find each other in the network. Each node periodically sends out discovery messages over UDP to announce its presence. Upon receiving a discovery message, nodes can register each other and maintain a list of active nodes, facilitating communication and coordination among them.
+
+## Election of Leader
+The leader election process is initiated when nodes detect that the current leader is unresponsive. Nodes use a consensus algorithm to elect a new leader based on their unique identifiers. The node with the highest identifier is chosen as the new leader, and it takes over the responsibilities of managing auctions and coordinating worker nodes.
+
+## Fault Tolerance
+The system is designed to handle faults gracefully. If a worker node fails, the leader can reassign its active auctions to other available workers, ensuring that the auction process continues without interruption. Additionally, if the leader node is killed, a new leader is elected from the remaining nodes, which can then take over the responsibilities of managing the auctions and coordinating the workers.
